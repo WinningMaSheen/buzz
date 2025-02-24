@@ -6,11 +6,13 @@ import datetime
 import sounddevice
 from enum import auto
 from typing import Optional, Tuple, Any
-
+from queue import Queue
+from threading import Thread
+import pyttsx3
 
 from PyQt6.QtCore import QThread, Qt, QThreadPool
 from PyQt6.QtGui import QTextCursor, QCloseEvent
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QFormLayout, QHBoxLayout, QMessageBox
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QFormLayout, QHBoxLayout, QMessageBox, QCheckBox
 
 from buzz.dialogs import show_model_download_error_dialog
 from buzz.locale import _
@@ -39,115 +41,49 @@ from buzz.widgets.transcriber.transcription_options_group_box import (
     TranscriptionOptionsGroupBox,
 )
 
-
-
-import queue
-import threading
-from typing import Optional
-from PyQt6.QtCore import QObject, pyqtSignal
-import pyttsx3
-
-class TTSQueueManager(QObject):
-    """
-    Manages a queue of text-to-speech requests, ensuring they play in order
-    and only one at a time.
-    """
-    tts_started = pyqtSignal(str)  # Emitted when TTS starts speaking a text
-    tts_finished = pyqtSignal(str)  # Emitted when TTS finishes speaking a text
-    tts_error = pyqtSignal(str)  # Emitted if there's an error
-
-    def __init__(self, parent: Optional[QObject] = None) -> None:
-        super().__init__(parent)
-        self.tts_queue = queue.Queue()
-        self.engine = pyttsx3.init()
-        self.is_speaking = False
-        self.should_stop = False
-        self.current_text = ""
-        self.thread = threading.Thread(target=self._process_queue, daemon=True)
-        self.thread.start()
-
-        # Configure TTS engine
-        self.engine.setProperty('rate', 150)  # Speed of speech
-        self.engine.setProperty('volume', 0.9)  # Volume (0.0 to 1.0)
-        
-        # Optional: Set a specific voice
-        voices = self.engine.getProperty('voices')
-        if voices:
-            self.engine.setProperty('voice', voices[0].id)  # Index 0 is usually default voice
-
-    def add_to_queue(self, text: str) -> None:
-        """Add text to the TTS queue."""
-        if text and text.strip():
-            self.tts_queue.put(text.strip())
-
-    def _process_queue(self) -> None:
-        """Main queue processing loop that runs in a separate thread."""
-        while not self.should_stop:
-            try:
-                # Get the next text to speak (blocks until item is available)
-                text = self.tts_queue.get(timeout=1.0)
-                self.current_text = text
-                self.is_speaking = True
-                
-                # Emit signal that we're starting to speak this text
-                self.tts_started.emit(text)
-
-                try:
-                    # Speak the text
-                    self.engine.say(text)
-                    self.engine.runAndWait()
-                    
-                    # Emit signal that we finished speaking this text
-                    self.tts_finished.emit(text)
-                except Exception as e:
-                    self.tts_error.emit(f"Error speaking text: {str(e)}")
-                finally:
-                    self.is_speaking = False
-                    self.current_text = ""
-                    self.tts_queue.task_done()
-
-            except queue.Empty:
-                # No items in queue, continue waiting
-                continue
-            except Exception as e:
-                self.tts_error.emit(f"Queue processing error: {str(e)}")
-
-    def clear_queue(self) -> None:
-        """Clear all pending TTS requests."""
-        while not self.tts_queue.empty():
-            try:
-                self.tts_queue.get_nowait()
-                self.tts_queue.task_done()
-            except queue.Empty:
-                break
-
-    def stop(self) -> None:
-        """Stop the TTS queue manager and cleanup."""
-        self.should_stop = True
-        self.clear_queue()
-        if self.is_speaking:
-            self.engine.stop()
-        self.thread.join(timeout=2.0)
-        self.engine.stop()
-
-    def set_voice(self, voice_id: str) -> None:
-        """Set the TTS voice by ID."""
-        self.engine.setProperty('voice', voice_id)
-
-    def set_rate(self, rate: int) -> None:
-        """Set the speech rate (words per minute)."""
-        self.engine.setProperty('rate', rate)
-
-    def set_volume(self, volume: float) -> None:
-        """Set the speech volume (0.0 to 1.0)."""
-        self.engine.setProperty('volume', volume)
-
-    def get_available_voices(self) -> list:
-        """Get list of available TTS voices."""
-        return self.engine.getProperty('voices')
-
 REAL_CHARS_REGEX = re.compile(r'\w')
 NO_SPACE_BETWEEN_SENTENCES = re.compile(r'([.!?。！？])([A-Z])')
+
+
+class TTSManager:
+    """Manages TTS operations with a queue system"""
+    def __init__(self):
+        self.engine = pyttsx3.init()
+        self.queue = Queue()
+        self.is_enabled = False
+        self.is_running = True
+        self.worker_thread = Thread(target=self._process_queue, daemon=True)
+        self.worker_thread.start()
+
+    def _process_queue(self):
+        while self.is_running:
+            if not self.is_enabled:
+                self.queue.queue.clear()  # Clear queue when disabled
+                continue
+                
+            try:
+                text = self.queue.get(timeout=1.0)  # 1 second timeout
+                if text:
+                    self.engine.say(text)
+                    self.engine.runAndWait()
+                self.queue.task_done()
+            except Queue.Empty:
+                continue  # No items in queue, continue checking
+
+    def add_to_queue(self, text: str):
+        if self.is_enabled:
+            self.queue.put(text)
+
+    def set_enabled(self, enabled: bool):
+        self.is_enabled = enabled
+        if not enabled:
+            self.queue.queue.clear()
+
+    def stop(self):
+        self.is_running = False
+        self.engine.stop()
+        if self.worker_thread.is_alive():
+            self.worker_thread.join(timeout=1.0)
 
 class RecordingTranscriberWidget(QWidget):
     current_status: "RecordingStatus"
@@ -185,33 +121,9 @@ class RecordingTranscriberWidget(QWidget):
         self.current_status = self.RecordingStatus.STOPPED
         self.setWindowTitle(_("Live Recording"))
 
-        # Initialize TTS Manager
-        self.tts_manager = TTSQueueManager(self)
-        self.tts_manager.tts_started.connect(self.on_tts_started)
-        self.tts_manager.tts_finished.connect(self.on_tts_finished)
-        self.tts_manager.tts_error.connect(self.on_tts_error)
-
         self.settings = Settings()
         self.transcriber_mode = list(RecordingTranscriberMode)[
             self.settings.value(key=Settings.Key.RECORDING_TRANSCRIBER_MODE, default_value=0)]
-
-        # TTS Settings
-        self.tts_enabled = self.settings.value(
-            key=Settings.Key.TTS_ENABLED,
-            default_value=True,
-        )
-        
-        if self.tts_enabled:
-            tts_rate = self.settings.value(
-                key=Settings.Key.TTS_RATE,
-                default_value=150,
-            )
-            tts_volume = self.settings.value(
-                key=Settings.Key.TTS_VOLUME,
-                default_value=0.9,
-            )
-            self.tts_manager.set_rate(tts_rate)
-            self.tts_manager.set_volume(tts_volume)
 
         default_language = self.settings.value(
             key=Settings.Key.RECORDING_TRANSCRIBER_LANGUAGE, default_value=""
@@ -264,51 +176,6 @@ class RecordingTranscriberWidget(QWidget):
             ),
         )
 
-        # Create TTS controls
-        tts_group_box = QGroupBox("Text-to-Speech Settings", self)
-        tts_layout = QVBoxLayout()
-
-        # TTS Enable/Disable checkbox
-        self.tts_enabled_checkbox = QCheckBox("Enable Text-to-Speech", self)
-        self.tts_enabled_checkbox.setChecked(self.tts_enabled)
-        self.tts_enabled_checkbox.toggled.connect(self.on_tts_enabled_changed)
-        tts_layout.addWidget(self.tts_enabled_checkbox)
-
-        # TTS Rate slider
-        rate_layout = QHBoxLayout()
-        rate_layout.addWidget(QLabel("Speech Rate:"))
-        self.tts_rate_slider = QSlider(Qt.Horizontal, self)
-        self.tts_rate_slider.setMinimum(50)
-        self.tts_rate_slider.setMaximum(300)
-        self.tts_rate_slider.setValue(tts_rate)
-        self.tts_rate_slider.valueChanged.connect(self.on_tts_rate_changed)
-        rate_layout.addWidget(self.tts_rate_slider)
-        tts_layout.addLayout(rate_layout)
-
-        # TTS Volume slider
-        volume_layout = QHBoxLayout()
-        volume_layout.addWidget(QLabel("Volume:"))
-        self.tts_volume_slider = QSlider(Qt.Horizontal, self)
-        self.tts_volume_slider.setMinimum(0)
-        self.tts_volume_slider.setMaximum(100)
-        self.tts_volume_slider.setValue(int(tts_volume * 100))
-        self.tts_volume_slider.valueChanged.connect(self.on_tts_volume_changed)
-        volume_layout.addWidget(self.tts_volume_slider)
-        tts_layout.addLayout(volume_layout)
-
-        # TTS Voice selection
-        voice_layout = QHBoxLayout()
-        voice_layout.addWidget(QLabel("Voice:"))
-        self.tts_voice_combo = QComboBox(self)
-        voices = self.tts_manager.get_available_voices()
-        for voice in voices:
-            self.tts_voice_combo.addItem(voice.name, voice.id)
-        self.tts_voice_combo.currentIndexChanged.connect(self.on_tts_voice_changed)
-        voice_layout.addWidget(self.tts_voice_combo)
-        tts_layout.addLayout(voice_layout)
-
-        tts_group_box.setLayout(tts_layout)
-
         self.audio_devices_combo_box = AudioDevicesComboBox(self)
         self.audio_devices_combo_box.device_changed.connect(self.on_device_changed)
         self.selected_device_id = self.audio_devices_combo_box.get_default_device_id()
@@ -341,7 +208,6 @@ class RecordingTranscriberWidget(QWidget):
         record_button_layout.addWidget(self.record_button)
 
         layout.addWidget(self.transcription_options_group_box)
-        layout.addWidget(tts_group_box)  # Add TTS controls
         layout.addLayout(recording_options_layout)
         layout.addLayout(record_button_layout)
         layout.addWidget(self.transcription_text_box)
@@ -361,47 +227,313 @@ class RecordingTranscriberWidget(QWidget):
             key=Settings.Key.RECORDING_TRANSCRIBER_EXPORT_ENABLED,
             default_value=False,
         )
+        self.tts_manager = TTSManager()
+        
+        # Add TTS toggle checkbox
+        self.tts_checkbox = QCheckBox(_("Enable Text-to-Speech"))
+        self.tts_checkbox.setChecked(False)
+        self.tts_checkbox.stateChanged.connect(self.on_tts_toggle)
+        
+        # Add checkbox to layout (after record_button_layout)
+        tts_layout = QHBoxLayout()
+        tts_layout.addWidget(self.tts_checkbox)
+        layout.addLayout(tts_layout)
 
-    def on_tts_enabled_changed(self, enabled: bool):
-        self.tts_enabled = enabled
-        self.settings.set_value(Settings.Key.TTS_ENABLED, enabled)
+    def on_tts_toggle(self, state):
+        self.tts_manager.set_enabled(state == Qt.CheckState.Checked.value)
 
-    def on_tts_rate_changed(self, value: int):
-        self.tts_manager.set_rate(value)
-        self.settings.set_value(Settings.Key.TTS_RATE, value)
-
-    def on_tts_volume_changed(self, value: int):
-        volume = value / 100.0
-        self.tts_manager.set_volume(volume)
-        self.settings.set_value(Settings.Key.TTS_VOLUME, volume)
-
-    def on_tts_voice_changed(self, index: int):
-        voice_id = self.tts_voice_combo.itemData(index)
-        self.tts_manager.set_voice(voice_id)
-
-    def on_tts_started(self, text: str):
-        logging.debug(f"TTS started speaking: {text[:50]}...")
-
-    def on_tts_finished(self, text: str):
-        logging.debug(f"TTS finished speaking: {text[:50]}...")
-
-    def on_tts_error(self, error: str):
-        logging.error(f"TTS error: {error}")
-        QMessageBox.warning(
-            self,
-            "TTS Error",
-            f"An error occurred with text-to-speech: {error}"
+    def setup_for_export(self):
+        export_folder = self.settings.value(
+            key=Settings.Key.RECORDING_TRANSCRIBER_EXPORT_FOLDER,
+            default_value="",
         )
 
-    # ... [Keep all existing methods from the original class]
+        date_time_now = datetime.datetime.now().strftime("%d-%b-%Y %H-%M-%S")
+
+        export_file_name_template = Settings().get_default_export_file_template()
+
+        export_file_name = (
+                export_file_name_template.replace("{{ input_file_name }}", "live recording")
+                .replace("{{ task }}", self.transcription_options.task.value)
+                .replace("{{ language }}", self.transcription_options.language or "")
+                .replace("{{ model_type }}", self.transcription_options.model.model_type.value)
+                .replace("{{ model_size }}", self.transcription_options.model.whisper_model_size or "")
+                .replace("{{ date_time }}", date_time_now)
+                + ".txt"
+        )
+
+        if not os.path.isdir(export_folder):
+            self.export_enabled = False
+
+        self.transcript_export_file = os.path.join(export_folder, export_file_name)
+        self.translation_export_file = self.transcript_export_file.replace(".txt", ".translated.txt")
+
+    def on_transcription_options_changed(
+        self, transcription_options: TranscriptionOptions
+    ):
+        self.transcription_options = transcription_options
+
+        if self.transcription_options.enable_llm_translation:
+            self.translation_text_box.show()
+        else:
+            self.translation_text_box.hide()
+
+    def on_device_changed(self, device_id: int):
+        self.selected_device_id = device_id
+        self.reset_recording_amplitude_listener()
+
+    def reset_recording_amplitude_listener(self):
+        if self.recording_amplitude_listener is not None:
+            self.recording_amplitude_listener.stop_recording()
+
+        # Listening to audio will fail if there are no input devices
+        if self.selected_device_id is None or self.selected_device_id == -1:
+            return
+
+        # Get the device sample rate before starting the listener as the PortAudio
+        # function # fails if you try to get the device's settings while recording
+        # is in progress.
+        self.device_sample_rate = RecordingTranscriber.get_device_sample_rate(
+            self.selected_device_id
+        )
+        logging.debug(f"Device sample rate: {self.device_sample_rate}")
+
+        self.recording_amplitude_listener = RecordingAmplitudeListener(
+            input_device_index=self.selected_device_id, parent=self
+        )
+        self.recording_amplitude_listener.amplitude_changed.connect(
+            self.on_recording_amplitude_changed
+        )
+        self.recording_amplitude_listener.start_recording()
+
+    def on_record_button_clicked(self):
+        if self.current_status == self.RecordingStatus.STOPPED:
+            self.start_recording()
+            self.current_status = self.RecordingStatus.RECORDING
+            self.record_button.set_recording()
+        else:  # RecordingStatus.RECORDING
+            self.stop_recording()
+            self.set_recording_status_stopped()
+
+    def start_recording(self):
+        self.record_button.setDisabled(True)
+        self.transcripts = []
+        self.translations = []
+
+        self.transcription_text_box.clear()
+        self.translation_text_box.clear()
+
+        if self.export_enabled:
+            self.setup_for_export()
+
+        model_path = self.transcription_options.model.get_local_model_path()
+        if model_path is not None:
+            self.on_model_loaded(model_path)
+            return
+
+        self.model_loader = ModelDownloader(model=self.transcription_options.model)
+        self.model_loader.signals.progress.connect(self.on_download_model_progress)
+        self.model_loader.signals.error.connect(self.on_download_model_error)
+        self.model_loader.signals.finished.connect(self.on_model_loaded)
+        QThreadPool().globalInstance().start(self.model_loader)
+
+    def on_model_loaded(self, model_path: str):
+        self.reset_recording_controls()
+        self.model_loader = None
+
+        self.transcription_thread = QThread()
+
+        # TODO: make runnable
+        self.transcriber = RecordingTranscriber(
+            input_device_index=self.selected_device_id,
+            sample_rate=self.device_sample_rate,
+            transcription_options=self.transcription_options,
+            model_path=model_path,
+            sounddevice=self.sounddevice,
+        )
+
+        self.transcriber.moveToThread(self.transcription_thread)
+
+        self.transcription_thread.started.connect(self.transcriber.start)
+        self.transcription_thread.finished.connect(
+            self.transcription_thread.deleteLater
+        )
+
+        self.transcriber.transcription.connect(self.on_next_transcription)
+
+        self.transcriber.finished.connect(self.on_transcriber_finished)
+        self.transcriber.finished.connect(self.transcription_thread.quit)
+        self.transcriber.finished.connect(self.transcriber.deleteLater)
+
+        self.transcriber.error.connect(self.on_transcriber_error)
+        self.transcriber.error.connect(self.transcription_thread.quit)
+        self.transcriber.error.connect(self.transcriber.deleteLater)
+
+        if self.transcription_options.enable_llm_translation:
+            self.translation_thread = QThread()
+
+            self.translator = Translator(
+                self.transcription_options,
+                self.transcription_options_group_box.advanced_settings_dialog,
+            )
+
+            self.translator.moveToThread(self.translation_thread)
+
+            self.translation_thread.started.connect(self.translator.start)
+            self.translation_thread.finished.connect(
+                self.translation_thread.deleteLater
+            )
+
+            self.translator.finished.connect(self.translation_thread.quit)
+            self.translator.finished.connect(self.translator.deleteLater)
+
+            self.translator.translation.connect(self.on_next_translation)
+
+            self.translation_thread.start()
+
+        self.transcription_thread.start()
+
+    def on_download_model_progress(self, progress: Tuple[float, float]):
+        (current_size, total_size) = progress
+
+        if self.model_download_progress_dialog is None:
+            self.model_download_progress_dialog = ModelDownloadProgressDialog(
+                model_type=self.transcription_options.model.model_type, parent=self
+            )
+            self.model_download_progress_dialog.canceled.connect(
+                self.on_cancel_model_progress_dialog
+            )
+
+        if self.model_download_progress_dialog is not None:
+            self.model_download_progress_dialog.set_value(
+                fraction_completed=current_size / total_size
+            )
+
+    def set_recording_status_stopped(self):
+        self.record_button.set_stopped()
+        self.current_status = self.RecordingStatus.STOPPED
+
+    def on_download_model_error(self, error: str):
+        self.reset_model_download()
+        show_model_download_error_dialog(self, error)
+        self.stop_recording()
+        self.set_recording_status_stopped()
+        self.record_button.setDisabled(False)
+
+    @staticmethod
+    def strip_newlines(text):
+        return text.replace('\r\n', os.linesep).replace('\n', os.linesep)
+
+    @staticmethod
+    def filter_text(text: str):
+        text = text.strip()
+
+        if not REAL_CHARS_REGEX.search(text):
+            return ""
+
+        return text
+
+    # Copilot magic implementation of a sliding window approach to find the longest common substring between two texts,
+    # ignoring the initial differences.
+    @staticmethod
+    def find_common_part(text1: str, text2: str) -> str:
+        len1, len2 = len(text1), len(text2)
+        max_len = 0
+        end_index = 0
+
+        lcsuff = [[0] * (len2 + 1) for _ in range(len1 + 1)]
+
+        for i in range(1, len1 + 1):
+            for j in range(1, len2 + 1):
+                if text1[i - 1] == text2[j - 1]:
+                    lcsuff[i][j] = lcsuff[i - 1][j - 1] + 1
+                    if lcsuff[i][j] > max_len:
+                        max_len = lcsuff[i][j]
+                        end_index = i
+                else:
+                    lcsuff[i][j] = 0
+
+        common_part = text1[end_index - max_len:end_index]
+
+        return common_part if len(common_part) >= 5 else ""
+
+    @staticmethod
+    def merge_text_no_overlap(text1: str, text2: str) -> str:
+        overlap_start = 0
+        for i in range(1, min(len(text1), len(text2)) + 1):
+            if text1[-i:] == text2[:i]:
+                overlap_start = i
+
+        return text1 + text2[overlap_start:]
+
+    def process_transcription_merge(self, text: str, texts, text_box, export_file):
+        texts.append(text)
+
+        # Remove possibly errorous parts from overlapping audio chunks
+        for i in range(len(texts) - 1):
+            common_part = self.find_common_part(texts[i], texts[i + 1])
+            if common_part:
+                common_length = len(common_part)
+                texts[i] = texts[i][:texts[i].rfind(common_part) + common_length]
+                texts[i + 1] = texts[i + 1][texts[i + 1].find(common_part):]
+
+        merged_texts = ""
+        for text in texts:
+            merged_texts = self.merge_text_no_overlap(merged_texts, text)
+
+        merged_texts = NO_SPACE_BETWEEN_SENTENCES.sub(r'\1 \2', merged_texts)
+
+        text_box.setPlainText(merged_texts)
+        text_box.moveCursor(QTextCursor.MoveOperation.End)
+
+        if self.export_enabled:
+            with open(export_file, "w") as f:
+                f.write(merged_texts)
+
+    def on_next_transcription(self, text: str):
+        text = self.filter_text(text)
+
+        if len(text) == 0:
+            return
+
+        if self.translator is not None:
+            self.translator.enqueue(text)
+
+        if self.transcriber_mode == RecordingTranscriberMode.APPEND_BELOW:
+            self.transcription_text_box.moveCursor(QTextCursor.MoveOperation.End)
+            if len(self.transcription_text_box.toPlainText()) > 0:
+                self.transcription_text_box.insertPlainText("\n\n")
+            self.transcription_text_box.insertPlainText(text)
+            self.transcription_text_box.moveCursor(QTextCursor.MoveOperation.End)
+
+            if self.export_enabled:
+                with open(self.transcript_export_file, "a") as f:
+                    f.write(text + "\n\n")
+
+        elif self.transcriber_mode == RecordingTranscriberMode.APPEND_ABOVE:
+            self.transcription_text_box.moveCursor(QTextCursor.MoveOperation.Start)
+            self.transcription_text_box.insertPlainText(text)
+            self.transcription_text_box.insertPlainText("\n\n")
+            self.transcription_text_box.moveCursor(QTextCursor.MoveOperation.Start)
+
+            if self.export_enabled:
+                with open(self.transcript_export_file, "r") as f:
+                    existing_content = f.read()
+
+                new_content = text + "\n\n" + existing_content
+
+                with open(self.transcript_export_file, "w") as f:
+                    f.write(new_content)
+
+        elif self.transcriber_mode == RecordingTranscriberMode.APPEND_AND_CORRECT:
+            self.process_transcription_merge(text, self.transcripts, self.transcription_text_box, self.transcript_export_file)
 
     def on_next_translation(self, text: str, _: Optional[int] = None):
         if len(text) == 0:
             return
-
-        # Add text to TTS queue if enabled
-        if self.tts_enabled and text:
-            self.tts_manager.add_to_queue(text)
+        
+        # Add text to TTS queue
+        self.tts_manager.add_to_queue(text)
 
         if self.transcriber_mode == RecordingTranscriberMode.APPEND_BELOW:
             self.translation_text_box.moveCursor(QTextCursor.MoveOperation.End)
@@ -432,13 +564,64 @@ class RecordingTranscriberWidget(QWidget):
         elif self.transcriber_mode == RecordingTranscriberMode.APPEND_AND_CORRECT:
             self.process_transcription_merge(text, self.translations, self.translation_text_box, self.translation_export_file)
 
-    def closeEvent(self, event: QCloseEvent) -> None:
+    def stop_recording(self):
+        if self.transcriber is not None:
+            self.transcriber.stop_recording()
+
+        if self.translator is not None:
+            self.translator.stop()
+
+        # Disable record button until the transcription is actually stopped in the background
+        self.record_button.setDisabled(True)
+
+    def on_transcriber_finished(self):
+        self.reset_record_button()
+
+    def on_transcriber_error(self, error: str):
+        self.reset_record_button()
+        self.set_recording_status_stopped()
+        QMessageBox.critical(
+            self,
+            "",
+            _("An error occurred while starting a new recording:")
+            + error
+            + ". "
+            + _(
+                "Please check your audio devices or check the application logs for more information."
+            ),
+        )
+
+    def on_cancel_model_progress_dialog(self):
         if self.model_loader is not None:
             self.model_loader.cancel()
+        self.reset_model_download()
+        self.set_recording_status_stopped()
+        self.record_button.setDisabled(False)
 
-        # Stop TTS
-        if self.tts_manager:
-            self.tts_manager.stop()
+    def reset_model_download(self):
+        if self.model_download_progress_dialog is not None:
+            self.model_download_progress_dialog.canceled.disconnect(
+                self.on_cancel_model_progress_dialog
+            )
+            self.model_download_progress_dialog.close()
+            self.model_download_progress_dialog = None
+
+    def reset_recording_controls(self):
+        # Clear text box placeholder because the first chunk takes a while to process
+        self.transcription_text_box.setPlaceholderText("")
+        self.reset_record_button()
+        self.reset_model_download()
+
+    def reset_record_button(self):
+        self.record_button.setEnabled(True)
+
+    def on_recording_amplitude_changed(self, amplitude: float):
+        self.audio_meter_widget.update_amplitude(amplitude)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self.tts_manager.stop()
+        if self.model_loader is not None:
+            self.model_loader.cancel()
 
         self.stop_recording()
         if self.recording_amplitude_listener is not None:
@@ -449,14 +632,12 @@ class RecordingTranscriberWidget(QWidget):
         if self.translator is not None:
             self.translator.stop()
 
-        # Save all settings
         self.settings.set_value(
             Settings.Key.RECORDING_TRANSCRIBER_LANGUAGE,
             self.transcription_options.language,
         )
         self.settings.set_value(
-            Settings.Key.RECORDING_TRANSCRIBER_TASK, 
-            self.transcription_options.task
+            Settings.Key.RECORDING_TRANSCRIBER_TASK, self.transcription_options.task
         )
         self.settings.set_value(
             Settings.Key.RECORDING_TRANSCRIBER_TEMPERATURE,
@@ -467,8 +648,7 @@ class RecordingTranscriberWidget(QWidget):
             self.transcription_options.initial_prompt,
         )
         self.settings.set_value(
-            Settings.Key.RECORDING_TRANSCRIBER_MODEL, 
-            self.transcription_options.model
+            Settings.Key.RECORDING_TRANSCRIBER_MODEL, self.transcription_options.model
         )
         self.settings.set_value(
             Settings.Key.RECORDING_TRANSCRIBER_ENABLE_LLM_TRANSLATION,
@@ -481,18 +661,6 @@ class RecordingTranscriberWidget(QWidget):
         self.settings.set_value(
             Settings.Key.RECORDING_TRANSCRIBER_LLM_PROMPT,
             self.transcription_options.llm_prompt,
-        )
-        self.settings.set_value(
-            Settings.Key.TTS_ENABLED,
-            self.tts_enabled,
-        )
-        self.settings.set_value(
-            Settings.Key.TTS_RATE,
-            self.tts_manager.engine.getProperty('rate'),
-        )
-        self.settings.set_value(
-            Settings.Key.TTS_VOLUME,
-            self.tts_manager.engine.getProperty('volume'),
         )
 
         return super().closeEvent(event)
