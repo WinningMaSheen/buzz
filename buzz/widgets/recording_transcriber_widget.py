@@ -46,99 +46,116 @@ REAL_CHARS_REGEX = re.compile(r'\w')
 NO_SPACE_BETWEEN_SENTENCES = re.compile(r'([.!?。！？])([A-Z])')
 
 
-class TTSManager:
-    """Manages TTS operations with a queue system"""
+class SimpleTTSManager:
+    """Manages TTS operations using system commands with a simple queue"""
+    
     def __init__(self):
-        self.setup_engine()
         self.queue = Queue()
         self.is_enabled = False
         self.is_running = True
-        self.ready = Event()
-        self.engine_lock = Lock()
+        self.platform = self._get_platform()
         self.worker_thread = Thread(target=self._process_queue, daemon=True)
         self.worker_thread.start()
-        logging.debug("TTS Manager initialized")
-
-    def setup_engine(self):
-        """Setup TTS engine with error handling"""
-        try:
-            self.engine = pyttsx3.init()
-            self.engine.setProperty('rate', 170)
-            self.engine.setProperty('volume', 0.9)
-            # Test the engine
-            self.engine.say('')
-            self.engine.runAndWait()
-            logging.debug("TTS engine initialized successfully")
-            return True
-        except Exception as e:
-            logging.error(f"Failed to initialize TTS engine: {str(e)}")
-            return False
-
+        logging.debug(f"Simple TTS Manager initialized for {self.platform}")
+    
+    def _get_platform(self):
+        """Detect the platform to determine which TTS method to use"""
+        import platform
+        system = platform.system()
+        logging.debug(f"Detected platform: {system}")
+        return system
+    
     def _process_queue(self):
+        """Process TTS requests from the queue"""
         while self.is_running:
             try:
                 if not self.is_enabled:
                     time.sleep(0.1)
                     continue
-
+                
                 try:
                     text = self.queue.get(timeout=1.0)
                 except Empty:
                     continue
-
+                
                 if not text or not self.is_enabled:
+                    self.queue.task_done()
                     continue
-
+                
                 logging.debug(f"TTS processing text: {text[:50]}...")
-                with self.engine_lock:
-                    try:
-                        self.engine.say(text)
-                        self.engine.runAndWait()
-                        logging.debug("TTS completed successfully")
-                    except Exception as e:
-                        logging.error(f"TTS engine error during speech: {str(e)}")
-                        # Try to reinitialize the engine
-                        self.setup_engine()
-                    finally:
-                        self.queue.task_done()
-
+                
+                try:
+                    self._speak_text(text)
+                    logging.debug("TTS process started")
+                except Exception as e:
+                    logging.error(f"TTS engine error during speech: {str(e)}")
+                finally:
+                    self.queue.task_done()
+            
             except Exception as e:
                 logging.error(f"TTS thread error: {str(e)}")
                 time.sleep(0.1)
-
+    
+    def _speak_text(self, text):
+        """Speak the text using the appropriate method for the platform"""
+        import subprocess
+        
+        try:
+            if self.platform == "Darwin":  # macOS
+                # Use the 'say' command on macOS
+                subprocess.Popen(["say", text])
+            
+            elif self.platform == "Windows":
+                # Use PowerShell to speak text on Windows
+                # Escape quotes in the text
+                text_escaped = text.replace('"', '`"')
+                powershell_cmd = f'Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak("{text_escaped}")'
+                subprocess.Popen(["powershell", "-Command", powershell_cmd])
+            
+            elif self.platform == "Linux":
+                # Use espeak on Linux if available
+                try:
+                    subprocess.Popen(["espeak", text])
+                except FileNotFoundError:
+                    logging.warning("espeak not found on Linux, TTS will not work")
+            
+            else:
+                logging.warning(f"TTS not supported on platform: {self.platform}")
+        
+        except Exception as e:
+            logging.error(f"Error executing TTS subprocess: {str(e)}")
+            raise
+    
     def add_to_queue(self, text: str):
+        """Add text to the TTS queue"""
         if self.is_enabled and text and text.strip():
             logging.debug(f"Adding to TTS queue: {text[:50]}...")
             self.queue.put(text.strip())
-
+    
     def set_enabled(self, enabled: bool):
+        """Enable or disable TTS"""
         was_enabled = self.is_enabled
         self.is_enabled = enabled
         logging.debug(f"TTS enabled changed from {was_enabled} to {enabled}")
         
         if not enabled:
-            self.queue.queue.clear()
-            with self.engine_lock:
-                try:
-                    self.engine.stop()
-                except Exception as e:
-                    logging.error(f"Error stopping engine: {str(e)}")
-
+            # Clear the queue when disabling
+            with self.queue.mutex:
+                self.queue.queue.clear()
+    
     def stop(self):
+        """Stop the TTS manager"""
         logging.debug("Stopping TTS manager")
         self.is_running = False
         self.is_enabled = False
-        self.queue.queue.clear()
         
-        with self.engine_lock:
-            try:
-                self.engine.stop()
-            except Exception as e:
-                logging.error(f"Error during final engine stop: {str(e)}")
-
+        # Clear the queue
+        with self.queue.mutex:
+            self.queue.queue.clear()
+        
         if self.worker_thread.is_alive():
             self.worker_thread.join(timeout=1.0)
-
+    
     def __del__(self):
         self.stop()
 
