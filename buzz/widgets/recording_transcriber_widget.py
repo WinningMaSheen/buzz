@@ -7,7 +7,7 @@ import sounddevice
 from enum import auto
 from typing import Optional, Tuple, Any
 from queue import Queue, Empty
-from threading import Thread, Lock
+from threading import Thread, Lock, Event
 import time
 import pyttsx3
 
@@ -49,69 +49,96 @@ NO_SPACE_BETWEEN_SENTENCES = re.compile(r'([.!?。！？])([A-Z])')
 class TTSManager:
     """Manages TTS operations with a queue system"""
     def __init__(self):
-        self.engine = pyttsx3.init()
-        # Set properties for speech rate (170 words per minute)
-        self.engine.setProperty('rate', 170)
-        # Add a lock for thread safety
-        self.engine_lock = Lock()
+        self.setup_engine()
         self.queue = Queue()
         self.is_enabled = False
         self.is_running = True
+        self.ready = Event()
+        self.engine_lock = Lock()
         self.worker_thread = Thread(target=self._process_queue, daemon=True)
         self.worker_thread.start()
         logging.debug("TTS Manager initialized")
 
+    def setup_engine(self):
+        """Setup TTS engine with error handling"""
+        try:
+            self.engine = pyttsx3.init()
+            self.engine.setProperty('rate', 170)
+            self.engine.setProperty('volume', 0.9)
+            # Test the engine
+            self.engine.say('')
+            self.engine.runAndWait()
+            logging.debug("TTS engine initialized successfully")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to initialize TTS engine: {str(e)}")
+            return False
+
     def _process_queue(self):
         while self.is_running:
-            if not self.is_enabled:
-                self.queue.queue.clear()  # Clear queue when disabled
-                time.sleep(0.1)  # Prevent busy waiting
-                continue
-                
             try:
-                text = self.queue.get(timeout=1.0)  # 1 second timeout
-                if text and self.is_enabled:  # Double check is_enabled before speaking
-                    logging.debug(f"TTS processing text: {text[:50]}...")
-                    with self.engine_lock:
-                        try:
-                            self.engine.say(text)
-                            self.engine.runAndWait()
-                        except Exception as e:
-                            logging.error(f"TTS engine error: {str(e)}")
-                self.queue.task_done()
-            except Empty:  # Using imported Empty from queue
-                continue  # No items in queue, continue checking
+                if not self.is_enabled:
+                    time.sleep(0.1)
+                    continue
+
+                try:
+                    text = self.queue.get(timeout=1.0)
+                except Empty:
+                    continue
+
+                if not text or not self.is_enabled:
+                    continue
+
+                logging.debug(f"TTS processing text: {text[:50]}...")
+                with self.engine_lock:
+                    try:
+                        self.engine.say(text)
+                        self.engine.runAndWait()
+                        logging.debug("TTS completed successfully")
+                    except Exception as e:
+                        logging.error(f"TTS engine error during speech: {str(e)}")
+                        # Try to reinitialize the engine
+                        self.setup_engine()
+                    finally:
+                        self.queue.task_done()
+
             except Exception as e:
-                logging.error(f"TTS error: {str(e)}")
+                logging.error(f"TTS thread error: {str(e)}")
+                time.sleep(0.1)
 
     def add_to_queue(self, text: str):
-        if self.is_enabled and text:
+        if self.is_enabled and text and text.strip():
             logging.debug(f"Adding to TTS queue: {text[:50]}...")
-            self.queue.put(text)
+            self.queue.put(text.strip())
 
     def set_enabled(self, enabled: bool):
+        was_enabled = self.is_enabled
         self.is_enabled = enabled
-        logging.debug(f"TTS enabled: {enabled}")
+        logging.debug(f"TTS enabled changed from {was_enabled} to {enabled}")
+        
         if not enabled:
             self.queue.queue.clear()
             with self.engine_lock:
                 try:
                     self.engine.stop()
-                except:
-                    pass
+                except Exception as e:
+                    logging.error(f"Error stopping engine: {str(e)}")
 
     def stop(self):
         logging.debug("Stopping TTS manager")
         self.is_running = False
+        self.is_enabled = False
+        self.queue.queue.clear()
+        
         with self.engine_lock:
             try:
                 self.engine.stop()
-            except:
-                pass
-        self.queue.queue.clear()
+            except Exception as e:
+                logging.error(f"Error during final engine stop: {str(e)}")
+
         if self.worker_thread.is_alive():
             self.worker_thread.join(timeout=1.0)
-            
+
     def __del__(self):
         self.stop()
 
@@ -257,6 +284,7 @@ class RecordingTranscriberWidget(QWidget):
             key=Settings.Key.RECORDING_TRANSCRIBER_EXPORT_ENABLED,
             default_value=False,
         )
+        # Initialize TTS manager
         self.tts_manager = TTSManager()
         
         # Add TTS toggle checkbox
@@ -269,8 +297,25 @@ class RecordingTranscriberWidget(QWidget):
         tts_layout.addWidget(self.tts_checkbox)
         layout.addLayout(tts_layout)
 
+
     def on_tts_toggle(self, state):
-        self.tts_manager.set_enabled(state == Qt.CheckState.Checked.value)
+        try:
+            enabled = state == Qt.CheckState.Checked.value
+            logging.debug(f"TTS toggle requested: {enabled}")
+            self.tts_manager.set_enabled(enabled)
+            
+            if not enabled:
+                self.tts_checkbox.setChecked(False)
+            
+        except Exception as e:
+            logging.error(f"Error in TTS toggle: {str(e)}")
+            self.tts_checkbox.setChecked(False)
+            QMessageBox.warning(
+                self,
+                "TTS Error",
+                "Failed to initialize text-to-speech. Please check your audio settings."
+            )
+
 
     def setup_for_export(self):
         export_folder = self.settings.value(
@@ -559,19 +604,24 @@ class RecordingTranscriberWidget(QWidget):
             self.process_transcription_merge(text, self.transcripts, self.transcription_text_box, self.transcript_export_file)
 
     def on_next_translation(self, text: str, _: Optional[int] = None):
-        if len(text) == 0:
+        if len(text.strip()) == 0:
             return
         
-        # Add text to TTS queue
-        self.tts_manager.add_to_queue(text)
+        try:
+            # Add text to TTS queue before updating UI
+            if self.tts_manager and self.tts_checkbox.isChecked():
+                self.tts_manager.add_to_queue(text)
+        except Exception as e:
+            logging.error(f"TTS error in translation: {str(e)}")
 
+        # Rest of the existing translation display code...
         if self.transcriber_mode == RecordingTranscriberMode.APPEND_BELOW:
             self.translation_text_box.moveCursor(QTextCursor.MoveOperation.End)
             if len(self.translation_text_box.toPlainText()) > 0:
                 self.translation_text_box.insertPlainText("\n\n")
             self.translation_text_box.insertPlainText(self.strip_newlines(text))
             self.translation_text_box.moveCursor(QTextCursor.MoveOperation.End)
-
+            
             if self.export_enabled:
                 with open(self.translation_export_file, "a") as f:
                     f.write(text + "\n\n")
@@ -595,14 +645,18 @@ class RecordingTranscriberWidget(QWidget):
             self.process_transcription_merge(text, self.translations, self.translation_text_box, self.translation_export_file)
 
     def stop_recording(self):
+        if self.tts_manager:
+            self.tts_manager.set_enabled(False)
+            self.tts_checkbox.setChecked(False)
+            
         if self.transcriber is not None:
             self.transcriber.stop_recording()
 
         if self.translator is not None:
             self.translator.stop()
 
-        # Disable record button until the transcription is actually stopped in the background
         self.record_button.setDisabled(True)
+
 
     def on_transcriber_finished(self):
         self.reset_record_button()
@@ -652,6 +706,9 @@ class RecordingTranscriberWidget(QWidget):
         self.tts_manager.stop()
         if self.model_loader is not None:
             self.model_loader.cancel()
+        
+        if self.tts_manager:
+            self.tts_manager.stop()
 
         self.stop_recording()
         if self.recording_amplitude_listener is not None:
