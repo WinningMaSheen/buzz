@@ -7,7 +7,7 @@ import sounddevice
 from enum import auto
 from typing import Optional, Tuple, Any
 from queue import Queue, Empty
-from threading import Thread
+from threading import Thread, Lock
 import time
 import pyttsx3
 
@@ -50,6 +50,10 @@ class TTSManager:
     """Manages TTS operations with a queue system"""
     def __init__(self):
         self.engine = pyttsx3.init()
+        # Set properties for speech rate (170 words per minute)
+        self.engine.setProperty('rate', 170)
+        # Add a lock for thread safety
+        self.engine_lock = Lock()
         self.queue = Queue()
         self.is_enabled = False
         self.is_running = True
@@ -68,8 +72,12 @@ class TTSManager:
                 text = self.queue.get(timeout=1.0)  # 1 second timeout
                 if text and self.is_enabled:  # Double check is_enabled before speaking
                     logging.debug(f"TTS processing text: {text[:50]}...")
-                    self.engine.say(text)
-                    self.engine.runAndWait()
+                    with self.engine_lock:
+                        try:
+                            self.engine.say(text)
+                            self.engine.runAndWait()
+                        except Exception as e:
+                            logging.error(f"TTS engine error: {str(e)}")
                 self.queue.task_done()
             except Empty:  # Using imported Empty from queue
                 continue  # No items in queue, continue checking
@@ -86,14 +94,27 @@ class TTSManager:
         logging.debug(f"TTS enabled: {enabled}")
         if not enabled:
             self.queue.queue.clear()
+            with self.engine_lock:
+                try:
+                    self.engine.stop()
+                except:
+                    pass
 
     def stop(self):
         logging.debug("Stopping TTS manager")
         self.is_running = False
-        self.engine.stop()
+        with self.engine_lock:
+            try:
+                self.engine.stop()
+            except:
+                pass
+        self.queue.queue.clear()
         if self.worker_thread.is_alive():
             self.worker_thread.join(timeout=1.0)
             
+    def __del__(self):
+        self.stop()
+
 class RecordingTranscriberWidget(QWidget):
     current_status: "RecordingStatus"
     transcription_options: TranscriptionOptions
