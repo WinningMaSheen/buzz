@@ -148,39 +148,42 @@ jobs:
       - name: Bundle
         run: |
           if [ "$RUNNER_OS" == "macOS" ]; then
-
             brew install create-dmg
 
-            # kill XProtect to prevent https://github.com/actions/runner-images/issues/7522
-            sudo pkill -9 XProtect >/dev/null || true;
-            while pgrep XProtect; do sleep 3; done;
+            if [[ $GITHUB_REF == refs/tags/* ]]; then
+              # For releases, use the signed version with all certificates
+              # kill XProtect to prevent https://github.com/actions/runner-images/issues/7522
+              sudo pkill -9 XProtect >/dev/null || true;
+              while pgrep XProtect; do sleep 3; done;
 
-            # create variables
-            CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
-            KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+              # create variables
+              CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+              KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
 
-            # import certificate and provisioning profile from secrets
-            echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o $CERTIFICATE_PATH
+              # import certificate and provisioning profile from secrets
+              echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o $CERTIFICATE_PATH
 
-            # create temporary keychain
-            security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-            security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
-            security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+              # create temporary keychain
+              security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+              security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+              security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
 
-            # import certificate to keychain
-            security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
-            security list-keychain -d user -s $KEYCHAIN_PATH
+              # import certificate to keychain
+              security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+              security list-keychain -d user -s $KEYCHAIN_PATH
 
-            # store notarytool credentials
-            xcrun notarytool store-credentials --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" notarytool --validate
+              # store notarytool credentials
+              xcrun notarytool store-credentials --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" notarytool --validate
 
-            poetry run make bundle_mac
+              poetry run make bundle_mac
+            else
+              # For non-release builds, use the unsigned version
+              poetry run make bundle_mac_unsigned
+            fi
 
           elif [ "$RUNNER_OS" == "Windows" ]; then
-
             cp -r ./dll_backup ./buzz/
             poetry run make bundle_windows
-
           fi
         env:
           BUZZ_CODESIGN_IDENTITY: ${{ secrets.BUZZ_CODESIGN_IDENTITY }}
