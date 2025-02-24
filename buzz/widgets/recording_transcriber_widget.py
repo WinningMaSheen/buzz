@@ -6,8 +6,9 @@ import datetime
 import sounddevice
 from enum import auto
 from typing import Optional, Tuple, Any
-from queue import Queue
+from queue import Queue, Empty
 from threading import Thread
+import time
 import pyttsx3
 
 from PyQt6.QtCore import QThread, Qt, QThreadPool
@@ -54,37 +55,45 @@ class TTSManager:
         self.is_running = True
         self.worker_thread = Thread(target=self._process_queue, daemon=True)
         self.worker_thread.start()
+        logging.debug("TTS Manager initialized")
 
     def _process_queue(self):
         while self.is_running:
             if not self.is_enabled:
                 self.queue.queue.clear()  # Clear queue when disabled
+                time.sleep(0.1)  # Prevent busy waiting
                 continue
                 
             try:
                 text = self.queue.get(timeout=1.0)  # 1 second timeout
-                if text:
+                if text and self.is_enabled:  # Double check is_enabled before speaking
+                    logging.debug(f"TTS processing text: {text[:50]}...")
                     self.engine.say(text)
                     self.engine.runAndWait()
                 self.queue.task_done()
-            except Queue.Empty:
+            except Empty:  # Using imported Empty from queue
                 continue  # No items in queue, continue checking
+            except Exception as e:
+                logging.error(f"TTS error: {str(e)}")
 
     def add_to_queue(self, text: str):
-        if self.is_enabled:
+        if self.is_enabled and text:
+            logging.debug(f"Adding to TTS queue: {text[:50]}...")
             self.queue.put(text)
 
     def set_enabled(self, enabled: bool):
         self.is_enabled = enabled
+        logging.debug(f"TTS enabled: {enabled}")
         if not enabled:
             self.queue.queue.clear()
 
     def stop(self):
+        logging.debug("Stopping TTS manager")
         self.is_running = False
         self.engine.stop()
         if self.worker_thread.is_alive():
             self.worker_thread.join(timeout=1.0)
-
+            
 class RecordingTranscriberWidget(QWidget):
     current_status: "RecordingStatus"
     transcription_options: TranscriptionOptions
