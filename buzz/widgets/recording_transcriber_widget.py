@@ -9,7 +9,7 @@ from typing import Optional, Tuple, Any
 from queue import Queue, Empty
 from threading import Thread, Lock, Event
 import time
-import pyttsx3
+import subprocess
 
 from PyQt6.QtCore import QThread, Qt, QThreadPool
 from PyQt6.QtGui import QTextCursor, QCloseEvent
@@ -46,118 +46,112 @@ REAL_CHARS_REGEX = re.compile(r'\w')
 NO_SPACE_BETWEEN_SENTENCES = re.compile(r'([.!?。！？])([A-Z])')
 
 
-class SimpleTTSManager:
-    """Manages TTS operations using system commands with a simple queue"""
+class SaferTTSManager:
+    """A minimal TTS manager that uses system commands and only initializes when needed"""
     
     def __init__(self):
-        self.queue = Queue()
         self.is_enabled = False
-        self.is_running = True
-        self.platform = self._get_platform()
-        self.worker_thread = Thread(target=self._process_queue, daemon=True)
-        self.worker_thread.start()
-        logging.debug(f"Simple TTS Manager initialized for {self.platform}")
+        self.current_process = None
+        self.platform = None
+        logging.debug("SaferTTSManager initialized")
     
     def _get_platform(self):
         """Detect the platform to determine which TTS method to use"""
-        import platform
-        system = platform.system()
-        logging.debug(f"Detected platform: {system}")
-        return system
-    
-    def _process_queue(self):
-        """Process TTS requests from the queue"""
-        while self.is_running:
+        if self.platform is None:
             try:
-                if not self.is_enabled:
-                    time.sleep(0.1)
-                    continue
-                
-                try:
-                    text = self.queue.get(timeout=1.0)
-                except Empty:
-                    continue
-                
-                if not text or not self.is_enabled:
-                    self.queue.task_done()
-                    continue
-                
-                logging.debug(f"TTS processing text: {text[:50]}...")
-                
-                try:
-                    self._speak_text(text)
-                    logging.debug("TTS process started")
-                except Exception as e:
-                    logging.error(f"TTS engine error during speech: {str(e)}")
-                finally:
-                    self.queue.task_done()
-            
+                import platform
+                self.platform = platform.system()
+                logging.debug(f"Detected platform: {self.platform}")
             except Exception as e:
-                logging.error(f"TTS thread error: {str(e)}")
-                time.sleep(0.1)
+                logging.error(f"Error detecting platform: {str(e)}")
+                self.platform = "Unknown"
+        return self.platform
     
-    def _speak_text(self, text):
-        """Speak the text using the appropriate method for the platform"""
-        import subprocess
+    def add_to_queue(self, text):
+        """Speak text if TTS is enabled"""
+        if not self.is_enabled or not text or not text.strip():
+            return
         
         try:
-            if self.platform == "Darwin":  # macOS
-                # Use the 'say' command on macOS
-                subprocess.Popen(["say", text])
+            # Check if we're already speaking something
+            if self.current_process is not None:
+                if self.current_process.poll() is None:
+                    # Process is still running, don't interrupt
+                    return
+                self.current_process = None
             
-            elif self.platform == "Windows":
+            self._speak_text(text.strip())
+        except Exception as e:
+            logging.error(f"Error in TTS add_to_queue: {str(e)}")
+    
+    def _speak_text(self, text):
+        """Speak text using the appropriate platform command"""
+        if not text:
+            return
+            
+        try:
+            import subprocess
+            platform = self._get_platform()
+            
+            if platform == "Darwin":  # macOS
+                # Use the 'say' command on macOS
+                self.current_process = subprocess.Popen(["say", text], 
+                                                       stdout=subprocess.DEVNULL, 
+                                                       stderr=subprocess.DEVNULL)
+            
+            elif platform == "Windows":
                 # Use PowerShell to speak text on Windows
-                # Escape quotes in the text
                 text_escaped = text.replace('"', '`"')
                 powershell_cmd = f'Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak("{text_escaped}")'
-                subprocess.Popen(["powershell", "-Command", powershell_cmd])
+                self.current_process = subprocess.Popen(["powershell", "-Command", powershell_cmd],
+                                                      stdout=subprocess.DEVNULL, 
+                                                      stderr=subprocess.DEVNULL)
             
-            elif self.platform == "Linux":
-                # Use espeak on Linux if available
+            elif platform == "Linux":
+                # Try espeak on Linux if available
                 try:
-                    subprocess.Popen(["espeak", text])
+                    self.current_process = subprocess.Popen(["espeak", text],
+                                                          stdout=subprocess.DEVNULL, 
+                                                          stderr=subprocess.DEVNULL)
                 except FileNotFoundError:
                     logging.warning("espeak not found on Linux, TTS will not work")
             
             else:
-                logging.warning(f"TTS not supported on platform: {self.platform}")
+                logging.warning(f"TTS not supported on platform: {platform}")
+            
+            logging.debug(f"TTS process started for text: {text[:50]}...")
         
         except Exception as e:
-            logging.error(f"Error executing TTS subprocess: {str(e)}")
-            raise
+            logging.error(f"Error executing TTS command: {str(e)}")
+            self.current_process = None
     
-    def add_to_queue(self, text: str):
-        """Add text to the TTS queue"""
-        if self.is_enabled and text and text.strip():
-            logging.debug(f"Adding to TTS queue: {text[:50]}...")
-            self.queue.put(text.strip())
-    
-    def set_enabled(self, enabled: bool):
+    def set_enabled(self, enabled):
         """Enable or disable TTS"""
         was_enabled = self.is_enabled
         self.is_enabled = enabled
         logging.debug(f"TTS enabled changed from {was_enabled} to {enabled}")
         
-        if not enabled:
-            # Clear the queue when disabling
-            with self.queue.mutex:
-                self.queue.queue.clear()
+        if not enabled and self.current_process is not None:
+            try:
+                self.current_process.terminate()
+                self.current_process = None
+            except Exception as e:
+                logging.error(f"Error stopping TTS process: {str(e)}")
     
     def stop(self):
-        """Stop the TTS manager"""
-        logging.debug("Stopping TTS manager")
-        self.is_running = False
-        self.is_enabled = False
-        
-        # Clear the queue
-        with self.queue.mutex:
-            self.queue.queue.clear()
-        
-        if self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=1.0)
+        """Clean up resources"""
+        try:
+            if self.current_process is not None:
+                self.current_process.terminate()
+                self.current_process = None
+            self.is_enabled = False
+            logging.debug("TTS manager stopped")
+        except Exception as e:
+            logging.error(f"Error stopping TTS manager: {str(e)}")
     
     def __del__(self):
         self.stop()
+
 
 class RecordingTranscriberWidget(QWidget):
     current_status: "RecordingStatus"
@@ -301,8 +295,9 @@ class RecordingTranscriberWidget(QWidget):
             key=Settings.Key.RECORDING_TRANSCRIBER_EXPORT_ENABLED,
             default_value=False,
         )
+        
         # Initialize TTS manager
-        self.tts_manager = TTSManager()
+        self.tts_manager = SaferTTSManager()
         
         # Add TTS toggle checkbox
         self.tts_checkbox = QCheckBox(_("Enable Text-to-Speech"))
@@ -625,8 +620,8 @@ class RecordingTranscriberWidget(QWidget):
             return
         
         try:
-            # Add text to TTS queue before updating UI
-            if self.tts_manager and self.tts_checkbox.isChecked():
+            # Add text to TTS queue if TTS is enabled
+            if self.tts_checkbox.isChecked():
                 self.tts_manager.add_to_queue(text)
         except Exception as e:
             logging.error(f"TTS error in translation: {str(e)}")
@@ -720,12 +715,11 @@ class RecordingTranscriberWidget(QWidget):
         self.audio_meter_widget.update_amplitude(amplitude)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        self.tts_manager.stop()
-        if self.model_loader is not None:
-            self.model_loader.cancel()
-        
         if self.tts_manager:
             self.tts_manager.stop()
+            
+        if self.model_loader is not None:
+            self.model_loader.cancel()
 
         self.stop_recording()
         if self.recording_amplitude_listener is not None:
