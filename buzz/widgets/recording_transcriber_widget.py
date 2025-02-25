@@ -71,7 +71,7 @@ class ImprovedTTSManager:
         # Set up the queue check timer
         self.queue_timer = QTimer()
         self.queue_timer.timeout.connect(self._check_queue)
-        self.queue_timer.setInterval(500)  # Check every 500ms
+        self.queue_timer.setInterval(150)  # Check every 150ms (70% reduction)
     
     def _get_platform(self):
         """Detect the platform to determine which TTS method to use"""
