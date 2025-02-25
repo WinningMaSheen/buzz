@@ -65,10 +65,13 @@ class ImprovedTTSManager:
         self.speed = 1.0  # Multiplier for default speed (1.0 = normal)
         self.process_timeout = 30  # Maximum time in seconds to wait for a TTS process
         self.max_queue_size = 50   # Maximum number of items in the queue
-        self.watchdog_active = False  # Flag for the watchdog timer
         self.process_start_time = None  # Track when current process started
-        self.consecutive_failures = 0   # Count consecutive failures to detect systemic issues
         logging.debug("ImprovedTTSManager initialized")
+        
+        # Set up the queue check timer
+        self.queue_timer = QTimer()
+        self.queue_timer.timeout.connect(self._check_queue)
+        self.queue_timer.setInterval(500)  # Check every 500ms
     
     def _get_platform(self):
         """Detect the platform to determine which TTS method to use"""
@@ -101,73 +104,43 @@ class ImprovedTTSManager:
             # Add the text to our queue
             self.message_queue.append(text)
             
-            # If we're not currently processing the queue, start processing
-            if not self.is_processing:
-                self._process_next_in_queue()
-                
-            # Start watchdog if not already active
-            self._ensure_watchdog_running()
+            # Make sure the queue timer is running
+            if not self.queue_timer.isActive():
+                self.queue_timer.start()
                 
         except Exception as e:
             logging.error(f"Error in TTS add_to_queue: {str(e)}")
     
-    def _ensure_watchdog_running(self):
-        """Ensure the watchdog timer is running to detect and recover from stuck processes"""
-        if not self.watchdog_active and self.is_enabled:
-            self.watchdog_active = True
-            QTimer.singleShot(5000, self._watchdog_check)  # Check every 5 seconds
-    
-    def _watchdog_check(self):
-        """Watchdog check to detect and recover from stuck processes"""
-        try:
-            if not self.is_enabled:
-                self.watchdog_active = False
+    def _check_queue(self):
+        """Main timer-based method to check queue status and process items"""
+        if not self.is_enabled:
+            self.queue_timer.stop()
+            return
+            
+        # If we have a current process, check if it's still running
+        if self.current_process:
+            # Check if process has completed
+            if self.current_process.poll() is not None:
+                logging.debug(f"TTS process completed with code {self.current_process.returncode}")
+                self.current_process = None
+                self.process_start_time = None
+            # Check if process has been running too long
+            elif self.process_start_time and time.time() - self.process_start_time > self.process_timeout:
+                logging.warning("TTS process is taking too long - terminating")
+                self._terminate_current_process()
+            else:
+                # Process is still running normally, nothing to do
                 return
-                
-            # Check if current process has been running too long
-            if (self.is_processing and self.current_process and 
-                self.process_start_time and 
-                time.time() - self.process_start_time > self.process_timeout):
-                
-                logging.warning(f"TTS process timed out after {self.process_timeout} seconds - forcing termination")
-                self._terminate_current_process()
-                self.consecutive_failures += 1
-                
-                # Force restart of queue processing
-                self.is_processing = False
-                QTimer.singleShot(100, self._process_next_in_queue)
-            
-            # Continue watchdog
-            self.watchdog_active = True
-            QTimer.singleShot(5000, self._watchdog_check)
         
-        except Exception as e:
-            logging.error(f"Error in TTS watchdog: {str(e)}")
-            self.watchdog_active = False
-            # Attempt to restart watchdog
-            QTimer.singleShot(5000, self._ensure_watchdog_running)
-    
-    def _check_item_progress(self):
-        """Check if the current TTS item is making progress and handle early failures"""
-        if not self.is_enabled or not self.current_process:
+        # If we get here, there's no current process running
+        
+        # If queue is empty, stop processing
+        if not self.message_queue:
             return
-            
-        # If process has already completed
-        if self.current_process and self.current_process.poll() is not None:
-            exit_code = self.current_process.returncode
-            
-            # Process completed but with an error
-            if exit_code != 0:
-                logging.warning(f"TTS process failed with exit code {exit_code}")
-                self.consecutive_failures += 1
-                self._terminate_current_process()
-                # Move to next item immediately
-                self.is_processing = False
-                QTimer.singleShot(50, self._process_next_in_queue)
-            return
-            
-        # Process is still running, check again soon
-        QTimer.singleShot(1000, self._check_item_progress)
+        
+        # Get the next text from the queue and speak it
+        text = self.message_queue.pop(0)
+        self._speak_text(text)
     
     def _terminate_current_process(self):
         """Safely terminate the current TTS process"""
@@ -180,80 +153,14 @@ class ImprovedTTSManager:
                 self.current_process = None
                 self.process_start_time = None
     
-    def _process_next_in_queue(self):
-        """Process the next message in the queue with failure detection and recovery"""
-        if not self.is_enabled:
-            self.is_processing = False
-            return
-            
-        # If queue is empty, stop processing
-        if not self.message_queue:
-            self.is_processing = False
-            self.consecutive_failures = 0  # Reset failure counter on empty queue
-            return
-        
-        self.is_processing = True
-        
-        try:
-            # If we have a current process, check if it's still running
-            if self.current_process and self.current_process.poll() is None:
-                # Check if process has been running too long
-                if self.process_start_time and time.time() - self.process_start_time > self.process_timeout:
-                    logging.warning("TTS process is taking too long - terminating")
-                    self._terminate_current_process()
-                else:
-                    # Process is still running normally, try again in a moment
-                    QTimer.singleShot(100, self._process_next_in_queue)
-                    return
-            
-            # Clear completed process
-            self.current_process = None
-            self.process_start_time = None
-            
-            # Get the next text from the queue
-            text = self.message_queue.pop(0)
-            
-            # If we've had too many consecutive failures, skip a few items to try to recover
-            if self.consecutive_failures >= 3:
-                logging.warning(f"TTS has {self.consecutive_failures} consecutive failures - skipping items to recover")
-                # Clear half the queue to recover
-                if len(self.message_queue) > 5:
-                    items_to_skip = len(self.message_queue) // 2
-                    self.message_queue = self.message_queue[items_to_skip:]
-                    logging.warning(f"Skipped {items_to_skip} items from TTS queue to recover from failures")
-                self.consecutive_failures = 0
-            
-            # Speak the text
-            success = self._speak_text(text)
-            
-            if success:
-                self.consecutive_failures = 0
-                # If successful, we schedule next check but don't immediately process next item
-                # Since we want the current item to play
-            else:
-                self.consecutive_failures += 1
-                logging.warning(f"TTS failure count: {self.consecutive_failures}")
-                # Immediately move to next item if current one failed
-                QTimer.singleShot(50, self._process_next_in_queue)
-                return
-            
-        except Exception as e:
-            logging.error(f"Error processing TTS queue: {str(e)}")
-            self.consecutive_failures += 1
-            
-            # Don't give up - schedule another attempt
-            self.is_processing = False
-            QTimer.singleShot(1000, self._process_next_in_queue)
-    
     def _speak_text(self, text):
         """Speak text using the appropriate platform command with speed control and error handling"""
         if not text:
-            return False
+            return
             
         try:
             import subprocess
             platform = self._get_platform()
-            success = True
             
             if platform == "Darwin":  # macOS
                 # Calculate rate based on speed multiplier (normal is ~175-200 wpm)
@@ -311,33 +218,21 @@ class ImprovedTTSManager:
                         )
                     except FileNotFoundError:
                         logging.warning("Neither espeak nor festival found on Linux, TTS will not work")
-                        self.current_process = None
-                        success = False
+                        return
             
             else:
                 logging.warning(f"TTS not supported on platform: {platform}")
-                self.current_process = None
-                success = False
+                return
             
-            # Record process start time for watchdog
+            # Record process start time
             if self.current_process:
                 self.process_start_time = time.time()
                 logging.debug(f"TTS process started for text: {text[:50]}... (speed: {self.speed})")
-                # Schedule a check soon after starting to catch early failures
-                QTimer.singleShot(500, self._check_item_progress)
-            else:
-                # If we couldn't create a process, move to next item
-                QTimer.singleShot(50, self._process_next_in_queue)
             
-            return success
-        
         except Exception as e:
             logging.error(f"Error executing TTS command: {str(e)}")
             self.current_process = None
             self.process_start_time = None
-            # Schedule next item since this one failed
-            QTimer.singleShot(50, self._process_next_in_queue)
-            return False
     
     def set_enabled(self, enabled):
         """Enable or disable TTS"""
@@ -348,19 +243,16 @@ class ImprovedTTSManager:
         if not enabled:
             # Clear the queue when disabling
             self.message_queue.clear()
-            self.is_processing = False
-            self.consecutive_failures = 0
             
             if self.current_process is not None:
                 self._terminate_current_process()
                 
-        elif enabled and not was_enabled:
-            # If we're enabling and have messages in the queue, start processing
-            if self.message_queue:
-                self._process_next_in_queue()
+            # Stop the timer
+            self.queue_timer.stop()
                 
-            # Start the watchdog
-            self._ensure_watchdog_running()
+        elif enabled and not was_enabled:
+            # Start the timer if we're enabling
+            self.queue_timer.start()
     
     def set_speed(self, speed_multiplier):
         """Set the TTS speed multiplier (1.0 is normal speed)"""
@@ -381,9 +273,6 @@ class ImprovedTTSManager:
         try:
             # Terminate the current process if it exists
             self._terminate_current_process()
-            
-            # Force processing of next item
-            QTimer.singleShot(50, self._process_next_in_queue)
             logging.debug("Skipped current TTS item")
             return True
         except Exception as e:
@@ -391,23 +280,12 @@ class ImprovedTTSManager:
             return False
     
     def check_health(self):
-        """Check the health of the TTS system and attempt recovery if needed"""
-        # If processing flag is set but nothing is happening, reset it
-        if self.is_processing and not self.current_process and self.message_queue:
-            logging.warning("TTS health check: detected stalled processing state, attempting recovery")
-            self.is_processing = False
-            self._process_next_in_queue()
+        """Check the health of the TTS system"""
+        # Make sure timer is running if enabled
+        if self.is_enabled and not self.queue_timer.isActive():
+            logging.warning("TTS health check: timer not active, restarting")
+            self.queue_timer.start()
             return True
-        
-        # Check if current process has completed with an error code
-        if self.current_process and self.current_process.poll() is not None:
-            if self.current_process.returncode != 0:
-                logging.warning(f"TTS health check: process exited with error code {self.current_process.returncode}")
-                self._terminate_current_process()
-                self.is_processing = False
-                self._process_next_in_queue()
-                return True
-        
         return False
     
     def clear_queue(self):
@@ -422,10 +300,10 @@ class ImprovedTTSManager:
         try:
             self.is_enabled = False
             self.message_queue.clear()
-            self.is_processing = False
-            self.watchdog_active = False
-            self.consecutive_failures = 0
             
+            if self.queue_timer.isActive():
+                self.queue_timer.stop()
+                
             self._terminate_current_process()
             logging.debug("TTS manager stopped")
         except Exception as e:
@@ -433,7 +311,6 @@ class ImprovedTTSManager:
     
     def __del__(self):
         self.stop()
-
 
 class RecordingTranscriberWidget(QWidget):
     current_status: "RecordingStatus"
