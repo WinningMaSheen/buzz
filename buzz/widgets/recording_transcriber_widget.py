@@ -50,7 +50,7 @@ NO_SPACE_BETWEEN_SENTENCES = re.compile(r'([.!?。！？])([A-Z])')
 
 
 class ImprovedTTSManager:
-    """A TTS manager that uses system commands with a proper sequential queue"""
+    """A TTS manager that uses system commands with a proper sequential queue and failsafe mechanisms"""
     
     def __init__(self):
         self.is_enabled = False
@@ -63,6 +63,11 @@ class ImprovedTTSManager:
         # Windows: normal = 0 (range -10 to 10)
         # Linux: normal = 175 wpm
         self.speed = 1.0  # Multiplier for default speed (1.0 = normal)
+        self.process_timeout = 30  # Maximum time in seconds to wait for a TTS process
+        self.max_queue_size = 50   # Maximum number of items in the queue
+        self.watchdog_active = False  # Flag for the watchdog timer
+        self.process_start_time = None  # Track when current process started
+        self.consecutive_failures = 0   # Count consecutive failures to detect systemic issues
         logging.debug("ImprovedTTSManager initialized")
     
     def _get_platform(self):
@@ -78,13 +83,20 @@ class ImprovedTTSManager:
         return self.platform
     
     def add_to_queue(self, text):
-        """Add text to the speech queue"""
+        """Add text to the speech queue with overflow protection"""
         if not self.is_enabled or not text or not text.strip():
             return
         
         try:
             text = text.strip()
-            logging.debug(f"Adding to TTS queue: {text[:50]}...")
+            
+            # Queue size management - if queue is too large, drop oldest items
+            if len(self.message_queue) >= self.max_queue_size:
+                overflow = len(self.message_queue) - self.max_queue_size + 1
+                self.message_queue = self.message_queue[overflow:]
+                logging.warning(f"TTS queue overflow: dropped {overflow} oldest items")
+            
+            logging.debug(f"Adding to TTS queue: {text[:50]}... (Queue size: {len(self.message_queue)})")
             
             # Add the text to our queue
             self.message_queue.append(text)
@@ -92,13 +104,70 @@ class ImprovedTTSManager:
             # If we're not currently processing the queue, start processing
             if not self.is_processing:
                 self._process_next_in_queue()
+                
+            # Start watchdog if not already active
+            self._ensure_watchdog_running()
+                
         except Exception as e:
             logging.error(f"Error in TTS add_to_queue: {str(e)}")
     
+    def _ensure_watchdog_running(self):
+        """Ensure the watchdog timer is running to detect and recover from stuck processes"""
+        if not self.watchdog_active and self.is_enabled:
+            self.watchdog_active = True
+            QTimer.singleShot(5000, self._watchdog_check)  # Check every 5 seconds
+    
+    def _watchdog_check(self):
+        """Watchdog check to detect and recover from stuck processes"""
+        try:
+            if not self.is_enabled:
+                self.watchdog_active = False
+                return
+                
+            # Check if current process has been running too long
+            if (self.is_processing and self.current_process and 
+                self.process_start_time and 
+                time.time() - self.process_start_time > self.process_timeout):
+                
+                logging.warning(f"TTS process timed out after {self.process_timeout} seconds - forcing termination")
+                self._terminate_current_process()
+                self.consecutive_failures += 1
+                
+                # Force restart of queue processing
+                self.is_processing = False
+                QTimer.singleShot(100, self._process_next_in_queue)
+            
+            # Continue watchdog
+            self.watchdog_active = True
+            QTimer.singleShot(5000, self._watchdog_check)
+        
+        except Exception as e:
+            logging.error(f"Error in TTS watchdog: {str(e)}")
+            self.watchdog_active = False
+            # Attempt to restart watchdog
+            QTimer.singleShot(5000, self._ensure_watchdog_running)
+    
+    def _terminate_current_process(self):
+        """Safely terminate the current TTS process"""
+        if self.current_process:
+            try:
+                self.current_process.terminate()
+            except Exception as e:
+                logging.error(f"Error terminating TTS process: {str(e)}")
+            finally:
+                self.current_process = None
+                self.process_start_time = None
+    
     def _process_next_in_queue(self):
-        """Process the next message in the queue"""
-        if not self.is_enabled or not self.message_queue:
+        """Process the next message in the queue with failure detection and recovery"""
+        if not self.is_enabled:
             self.is_processing = False
+            return
+            
+        # If queue is empty, stop processing
+        if not self.message_queue:
+            self.is_processing = False
+            self.consecutive_failures = 0  # Reset failure counter on empty queue
             return
         
         self.is_processing = True
@@ -106,30 +175,61 @@ class ImprovedTTSManager:
         try:
             # If we have a current process, check if it's still running
             if self.current_process and self.current_process.poll() is None:
-                # Process is still running, try again in a moment
-                QTimer.singleShot(100, self._process_next_in_queue)
-                return
+                # Check if process has been running too long
+                if self.process_start_time and time.time() - self.process_start_time > self.process_timeout:
+                    logging.warning("TTS process is taking too long - terminating")
+                    self._terminate_current_process()
+                else:
+                    # Process is still running normally, try again in a moment
+                    QTimer.singleShot(100, self._process_next_in_queue)
+                    return
+            
+            # Clear completed process
+            self.current_process = None
+            self.process_start_time = None
             
             # Get the next text from the queue
             text = self.message_queue.pop(0)
             
+            # If we've had too many consecutive failures, skip a few items to try to recover
+            if self.consecutive_failures >= 3:
+                logging.warning(f"TTS has {self.consecutive_failures} consecutive failures - skipping items to recover")
+                # Clear half the queue to recover
+                if len(self.message_queue) > 5:
+                    items_to_skip = len(self.message_queue) // 2
+                    self.message_queue = self.message_queue[items_to_skip:]
+                    logging.warning(f"Skipped {items_to_skip} items from TTS queue to recover from failures")
+                self.consecutive_failures = 0
+            
             # Speak the text
-            self._speak_text(text)
+            success = self._speak_text(text)
+            
+            if success:
+                self.consecutive_failures = 0
+            else:
+                self.consecutive_failures += 1
+                logging.warning(f"TTS failure count: {self.consecutive_failures}")
             
             # Schedule a check to process the next message
             QTimer.singleShot(100, self._process_next_in_queue)
+        
         except Exception as e:
             logging.error(f"Error processing TTS queue: {str(e)}")
+            self.consecutive_failures += 1
+            
+            # Don't give up - schedule another attempt
             self.is_processing = False
+            QTimer.singleShot(1000, self._process_next_in_queue)
     
     def _speak_text(self, text):
-        """Speak text using the appropriate platform command with speed control"""
+        """Speak text using the appropriate platform command with speed control and error handling"""
         if not text:
-            return
+            return False
             
         try:
             import subprocess
             platform = self._get_platform()
+            success = True
             
             if platform == "Darwin":  # macOS
                 # Calculate rate based on speed multiplier (normal is ~175-200 wpm)
@@ -147,12 +247,17 @@ class ImprovedTTSManager:
                 rate_value = int((self.speed - 1.0) * 10)  # Convert multiplier to Windows range
                 rate_value = max(-10, min(10, rate_value))  # Ensure within valid range
                 
-                text_escaped = text.replace('"', '`"')
+                # Limit text length for PowerShell to avoid issues
+                if len(text) > 500:
+                    text = text[:497] + "..."
+                
+                text_escaped = text.replace('"', '`"').replace('$', '`$')
                 powershell_cmd = (
                     f'Add-Type -AssemblyName System.Speech; '
                     f'$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer; '
                     f'$synth.Rate = {rate_value}; '
-                    f'$synth.Speak("{text_escaped}")'
+                    f'$synth.Speak("{text_escaped}"); '
+                    f'$synth.Dispose()'  # Explicitly dispose to free resources
                 )
                 self.current_process = subprocess.Popen(
                     ["powershell", "-Command", powershell_cmd],
@@ -171,18 +276,37 @@ class ImprovedTTSManager:
                         stderr=subprocess.DEVNULL
                     )
                 except FileNotFoundError:
-                    logging.warning("espeak not found on Linux, TTS will not work")
-                    self.current_process = None
+                    # Try festival as a fallback
+                    try:
+                        text_escaped = text.replace('"', '\\"')
+                        self.current_process = subprocess.Popen(
+                            ["echo", text_escaped, "|", "festival", "--tts"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            shell=True
+                        )
+                    except FileNotFoundError:
+                        logging.warning("Neither espeak nor festival found on Linux, TTS will not work")
+                        self.current_process = None
+                        success = False
             
             else:
                 logging.warning(f"TTS not supported on platform: {platform}")
                 self.current_process = None
+                success = False
             
-            logging.debug(f"TTS process started for text: {text[:50]}... (speed: {self.speed})")
+            # Record process start time for watchdog
+            if self.current_process:
+                self.process_start_time = time.time()
+                logging.debug(f"TTS process started for text: {text[:50]}... (speed: {self.speed})")
+            
+            return success
         
         except Exception as e:
             logging.error(f"Error executing TTS command: {str(e)}")
             self.current_process = None
+            self.process_start_time = None
+            return False
     
     def set_enabled(self, enabled):
         """Enable or disable TTS"""
@@ -194,16 +318,18 @@ class ImprovedTTSManager:
             # Clear the queue when disabling
             self.message_queue.clear()
             self.is_processing = False
+            self.consecutive_failures = 0
             
             if self.current_process is not None:
-                try:
-                    self.current_process.terminate()
-                    self.current_process = None
-                except Exception as e:
-                    logging.error(f"Error stopping TTS process: {str(e)}")
-        elif enabled and not was_enabled and self.message_queue:
+                self._terminate_current_process()
+                
+        elif enabled and not was_enabled:
             # If we're enabling and have messages in the queue, start processing
-            self._process_next_in_queue()
+            if self.message_queue:
+                self._process_next_in_queue()
+                
+            # Start the watchdog
+            self._ensure_watchdog_running()
     
     def set_speed(self, speed_multiplier):
         """Set the TTS speed multiplier (1.0 is normal speed)"""
@@ -222,18 +348,33 @@ class ImprovedTTSManager:
     def skip_current(self):
         """Skip the current item in the TTS queue"""
         try:
-            if self.current_process is not None and self.current_process.poll() is None:
-                # Terminate the current speech process
-                self.current_process.terminate()
-                self.current_process = None
-                logging.debug("Skipped current TTS item")
+            # Terminate the current process if it exists
+            self._terminate_current_process()
             
             # Force processing of next item
             QTimer.singleShot(50, self._process_next_in_queue)
+            logging.debug("Skipped current TTS item")
             return True
         except Exception as e:
             logging.error(f"Error skipping current TTS item: {str(e)}")
             return False
+    
+    def check_health(self):
+        """Check the health of the TTS system and attempt recovery if needed"""
+        # If processing flag is set but nothing is happening, reset it
+        if self.is_processing and not self.current_process and self.message_queue:
+            logging.warning("TTS health check: detected stalled processing state, attempting recovery")
+            self.is_processing = False
+            self._process_next_in_queue()
+            return True
+        return False
+    
+    def clear_queue(self):
+        """Clear the TTS queue completely"""
+        queue_size = len(self.message_queue)
+        self.message_queue.clear()
+        self._terminate_current_process()
+        logging.debug(f"Cleared TTS queue ({queue_size} items)")
     
     def stop(self):
         """Clean up resources"""
@@ -241,11 +382,10 @@ class ImprovedTTSManager:
             self.is_enabled = False
             self.message_queue.clear()
             self.is_processing = False
+            self.watchdog_active = False
+            self.consecutive_failures = 0
             
-            if self.current_process is not None:
-                self.current_process.terminate()
-                self.current_process = None
-                
+            self._terminate_current_process()
             logging.debug("TTS manager stopped")
         except Exception as e:
             logging.error(f"Error stopping TTS manager: {str(e)}")
@@ -427,15 +567,30 @@ class RecordingTranscriberWidget(QWidget):
         speed_layout.addWidget(self.tts_speed_label)
         tts_layout.addLayout(speed_layout)
         
+        # TTS control buttons layout
+        buttons_layout = QHBoxLayout()
+        
         # Skip button
         self.tts_skip_button = QPushButton(_("Skip Current"))
         self.tts_skip_button.clicked.connect(self.on_tts_skip_clicked)
         self.tts_skip_button.setEnabled(False)  # Initially disabled
-        tts_layout.addWidget(self.tts_skip_button)
+        buttons_layout.addWidget(self.tts_skip_button)
+        
+        # Clear queue button
+        self.tts_clear_button = QPushButton(_("Clear Queue"))
+        self.tts_clear_button.clicked.connect(self.on_tts_clear_clicked)
+        self.tts_clear_button.setEnabled(False)  # Initially disabled
+        buttons_layout.addWidget(self.tts_clear_button)
+        
+        tts_layout.addLayout(buttons_layout)
         
         self.tts_group_box.setLayout(tts_layout)
         layout.addWidget(self.tts_group_box)
-
+        
+        # Add a health check timer
+        self.tts_health_timer = QTimer()
+        self.tts_health_timer.timeout.connect(self.check_tts_health)
+        self.tts_health_timer.start(10000)  # Check every 10 seconds
 
     def on_tts_toggle(self, state):
         try:
@@ -443,8 +598,9 @@ class RecordingTranscriberWidget(QWidget):
             logging.debug(f"TTS toggle requested: {enabled}")
             self.tts_manager.set_enabled(enabled)
             
-            # Enable or disable the skip button based on TTS state
+            # Enable or disable control buttons based on TTS state
             self.tts_skip_button.setEnabled(enabled)
+            self.tts_clear_button.setEnabled(enabled)
             
             if not enabled:
                 self.tts_checkbox.setChecked(False)
@@ -477,33 +633,20 @@ class RecordingTranscriberWidget(QWidget):
                 self.tts_manager.skip_current()
         except Exception as e:
             logging.error(f"Error skipping TTS item: {str(e)}")
-
-
-    def setup_for_export(self):
-        export_folder = self.settings.value(
-            key=Settings.Key.RECORDING_TRANSCRIBER_EXPORT_FOLDER,
-            default_value="",
-        )
-
-        date_time_now = datetime.datetime.now().strftime("%d-%b-%Y %H-%M-%S")
-
-        export_file_name_template = Settings().get_default_export_file_template()
-
-        export_file_name = (
-                export_file_name_template.replace("{{ input_file_name }}", "live recording")
-                .replace("{{ task }}", self.transcription_options.task.value)
-                .replace("{{ language }}", self.transcription_options.language or "")
-                .replace("{{ model_type }}", self.transcription_options.model.model_type.value)
-                .replace("{{ model_size }}", self.transcription_options.model.whisper_model_size or "")
-                .replace("{{ date_time }}", date_time_now)
-                + ".txt"
-        )
-
-        if not os.path.isdir(export_folder):
-            self.export_enabled = False
-
-        self.transcript_export_file = os.path.join(export_folder, export_file_name)
-        self.translation_export_file = self.transcript_export_file.replace(".txt", ".translated.txt")
+            
+    def on_tts_clear_clicked(self):
+        try:
+            if self.tts_manager:
+                self.tts_manager.clear_queue()
+        except Exception as e:
+            logging.error(f"Error clearing TTS queue: {str(e)}")
+            
+    def check_tts_health(self):
+        try:
+            if self.tts_manager and self.tts_checkbox.isChecked():
+                self.tts_manager.check_health()
+        except Exception as e:
+            logging.error(f"Error in TTS health check: {str(e)}")
 
     def on_transcription_options_changed(
         self, transcription_options: TranscriptionOptions
@@ -646,6 +789,32 @@ class RecordingTranscriberWidget(QWidget):
                 fraction_completed=current_size / total_size
             )
 
+    def setup_for_export(self):
+        export_folder = self.settings.value(
+            key=Settings.Key.RECORDING_TRANSCRIBER_EXPORT_FOLDER,
+            default_value="",
+        )
+
+        date_time_now = datetime.datetime.now().strftime("%d-%b-%Y %H-%M-%S")
+
+        export_file_name_template = Settings().get_default_export_file_template()
+
+        export_file_name = (
+                export_file_name_template.replace("{{ input_file_name }}", "live recording")
+                .replace("{{ task }}", self.transcription_options.task.value)
+                .replace("{{ language }}", self.transcription_options.language or "")
+                .replace("{{ model_type }}", self.transcription_options.model.model_type.value)
+                .replace("{{ model_size }}", self.transcription_options.model.whisper_model_size or "")
+                .replace("{{ date_time }}", date_time_now)
+                + ".txt"
+        )
+
+        if not os.path.isdir(export_folder):
+            self.export_enabled = False
+
+        self.transcript_export_file = os.path.join(export_folder, export_file_name)
+        self.translation_export_file = self.transcript_export_file.replace(".txt", ".translated.txt")
+
     def set_recording_status_stopped(self):
         self.record_button.set_stopped()
         self.current_status = self.RecordingStatus.STOPPED
@@ -770,9 +939,33 @@ class RecordingTranscriberWidget(QWidget):
             return
         
         try:
-            # Add text to TTS queue if TTS is enabled
+            # Add text to TTS queue if TTS is enabled, with improved handling
             if self.tts_checkbox.isChecked():
-                self.tts_manager.add_to_queue(text)
+                # Preprocess text for TTS - break long text into smaller chunks
+                if len(text) > 300:  # If text is very long
+                    sentences = re.split(r'(?<=[.!?。！？])\s+', text)
+                    chunks = []
+                    current_chunk = ""
+                    
+                    for sentence in sentences:
+                        if len(current_chunk) + len(sentence) < 300:
+                            current_chunk += sentence + " "
+                        else:
+                            if current_chunk:
+                                chunks.append(current_chunk.strip())
+                            current_chunk = sentence + " "
+                    
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    
+                    # Queue each chunk separately
+                    for chunk in chunks:
+                        self.tts_manager.add_to_queue(chunk)
+                else:
+                    self.tts_manager.add_to_queue(text)
+                    
+                # Enable clear button when there's text in the queue
+                self.tts_clear_button.setEnabled(True)
         except Exception as e:
             logging.error(f"TTS error in translation: {str(e)}")
 
@@ -810,6 +1003,8 @@ class RecordingTranscriberWidget(QWidget):
         if self.tts_manager:
             self.tts_manager.set_enabled(False)
             self.tts_checkbox.setChecked(False)
+            self.tts_clear_button.setEnabled(False)
+            self.tts_skip_button.setEnabled(False)
             
         if self.transcriber is not None:
             self.transcriber.stop_recording()
@@ -867,6 +1062,9 @@ class RecordingTranscriberWidget(QWidget):
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.tts_manager:
             self.tts_manager.stop()
+            
+        if self.tts_health_timer:
+            self.tts_health_timer.stop()
             
         if self.model_loader is not None:
             self.model_loader.cancel()
