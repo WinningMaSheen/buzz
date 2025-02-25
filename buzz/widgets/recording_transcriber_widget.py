@@ -11,7 +11,7 @@ from threading import Thread, Lock, Event
 import time
 import subprocess
 
-from PyQt6.QtCore import QThread, Qt, QThreadPool
+from PyQt6.QtCore import QThread, Qt, QThreadPool, QTimer
 from PyQt6.QtGui import QTextCursor, QCloseEvent
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QFormLayout, QHBoxLayout, QMessageBox, QCheckBox
 
@@ -46,14 +46,16 @@ REAL_CHARS_REGEX = re.compile(r'\w')
 NO_SPACE_BETWEEN_SENTENCES = re.compile(r'([.!?。！？])([A-Z])')
 
 
-class SaferTTSManager:
-    """A minimal TTS manager that uses system commands and only initializes when needed"""
+class ImprovedTTSManager:
+    """A TTS manager that uses system commands with a proper sequential queue"""
     
     def __init__(self):
         self.is_enabled = False
         self.current_process = None
         self.platform = None
-        logging.debug("SaferTTSManager initialized")
+        self.message_queue = []
+        self.is_processing = False
+        logging.debug("ImprovedTTSManager initialized")
     
     def _get_platform(self):
         """Detect the platform to determine which TTS method to use"""
@@ -68,21 +70,49 @@ class SaferTTSManager:
         return self.platform
     
     def add_to_queue(self, text):
-        """Speak text if TTS is enabled"""
+        """Add text to the speech queue"""
         if not self.is_enabled or not text or not text.strip():
             return
         
         try:
-            # Check if we're already speaking something
-            if self.current_process is not None:
-                if self.current_process.poll() is None:
-                    # Process is still running, don't interrupt
-                    return
-                self.current_process = None
+            text = text.strip()
+            logging.debug(f"Adding to TTS queue: {text[:50]}...")
             
-            self._speak_text(text.strip())
+            # Add the text to our queue
+            self.message_queue.append(text)
+            
+            # If we're not currently processing the queue, start processing
+            if not self.is_processing:
+                self._process_next_in_queue()
         except Exception as e:
             logging.error(f"Error in TTS add_to_queue: {str(e)}")
+    
+    def _process_next_in_queue(self):
+        """Process the next message in the queue"""
+        if not self.is_enabled or not self.message_queue:
+            self.is_processing = False
+            return
+        
+        self.is_processing = True
+        
+        try:
+            # If we have a current process, check if it's still running
+            if self.current_process and self.current_process.poll() is None:
+                # Process is still running, try again in a moment
+                QTimer.singleShot(100, self._process_next_in_queue)
+                return
+            
+            # Get the next text from the queue
+            text = self.message_queue.pop(0)
+            
+            # Speak the text
+            self._speak_text(text)
+            
+            # Schedule a check to process the next message
+            QTimer.singleShot(100, self._process_next_in_queue)
+        except Exception as e:
+            logging.error(f"Error processing TTS queue: {str(e)}")
+            self.is_processing = False
     
     def _speak_text(self, text):
         """Speak text using the appropriate platform command"""
@@ -115,9 +145,11 @@ class SaferTTSManager:
                                                           stderr=subprocess.DEVNULL)
                 except FileNotFoundError:
                     logging.warning("espeak not found on Linux, TTS will not work")
+                    self.current_process = None
             
             else:
                 logging.warning(f"TTS not supported on platform: {platform}")
+                self.current_process = None
             
             logging.debug(f"TTS process started for text: {text[:50]}...")
         
@@ -131,20 +163,32 @@ class SaferTTSManager:
         self.is_enabled = enabled
         logging.debug(f"TTS enabled changed from {was_enabled} to {enabled}")
         
-        if not enabled and self.current_process is not None:
-            try:
-                self.current_process.terminate()
-                self.current_process = None
-            except Exception as e:
-                logging.error(f"Error stopping TTS process: {str(e)}")
+        if not enabled:
+            # Clear the queue when disabling
+            self.message_queue.clear()
+            self.is_processing = False
+            
+            if self.current_process is not None:
+                try:
+                    self.current_process.terminate()
+                    self.current_process = None
+                except Exception as e:
+                    logging.error(f"Error stopping TTS process: {str(e)}")
+        elif enabled and not was_enabled and self.message_queue:
+            # If we're enabling and have messages in the queue, start processing
+            self._process_next_in_queue()
     
     def stop(self):
         """Clean up resources"""
         try:
+            self.is_enabled = False
+            self.message_queue.clear()
+            self.is_processing = False
+            
             if self.current_process is not None:
                 self.current_process.terminate()
                 self.current_process = None
-            self.is_enabled = False
+                
             logging.debug("TTS manager stopped")
         except Exception as e:
             logging.error(f"Error stopping TTS manager: {str(e)}")
@@ -297,7 +341,7 @@ class RecordingTranscriberWidget(QWidget):
         )
         
         # Initialize TTS manager
-        self.tts_manager = SaferTTSManager()
+        self.tts_manager = ImprovedTTSManager()
         
         # Add TTS toggle checkbox
         self.tts_checkbox = QCheckBox(_("Enable Text-to-Speech"))
