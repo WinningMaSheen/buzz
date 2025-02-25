@@ -13,7 +13,10 @@ import subprocess
 
 from PyQt6.QtCore import QThread, Qt, QThreadPool, QTimer
 from PyQt6.QtGui import QTextCursor, QCloseEvent
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QFormLayout, QHBoxLayout, QMessageBox, QCheckBox
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QFormLayout, QHBoxLayout, QMessageBox, QCheckBox,
+    QGroupBox, QLabel, QSlider, QPushButton
+)
 
 from buzz.dialogs import show_model_download_error_dialog
 from buzz.locale import _
@@ -55,6 +58,11 @@ class ImprovedTTSManager:
         self.platform = None
         self.message_queue = []
         self.is_processing = False
+        # Default speed settings for different platforms
+        # macOS: normal = 175-200 wpm
+        # Windows: normal = 0 (range -10 to 10)
+        # Linux: normal = 175 wpm
+        self.speed = 1.0  # Multiplier for default speed (1.0 = normal)
         logging.debug("ImprovedTTSManager initialized")
     
     def _get_platform(self):
@@ -115,7 +123,7 @@ class ImprovedTTSManager:
             self.is_processing = False
     
     def _speak_text(self, text):
-        """Speak text using the appropriate platform command"""
+        """Speak text using the appropriate platform command with speed control"""
         if not text:
             return
             
@@ -124,25 +132,44 @@ class ImprovedTTSManager:
             platform = self._get_platform()
             
             if platform == "Darwin":  # macOS
-                # Use the 'say' command on macOS
-                self.current_process = subprocess.Popen(["say", text], 
-                                                       stdout=subprocess.DEVNULL, 
-                                                       stderr=subprocess.DEVNULL)
+                # Calculate rate based on speed multiplier (normal is ~175-200 wpm)
+                rate = int(175 * self.speed)
+                # Use the 'say' command on macOS with rate control
+                self.current_process = subprocess.Popen(
+                    ["say", "-r", str(rate), text], 
+                    stdout=subprocess.DEVNULL, 
+                    stderr=subprocess.DEVNULL
+                )
             
             elif platform == "Windows":
-                # Use PowerShell to speak text on Windows
+                # Use PowerShell to speak text on Windows with rate control
+                # Windows SpeechSynthesizer Rate range: -10 (slow) to 10 (fast), 0 is normal
+                rate_value = int((self.speed - 1.0) * 10)  # Convert multiplier to Windows range
+                rate_value = max(-10, min(10, rate_value))  # Ensure within valid range
+                
                 text_escaped = text.replace('"', '`"')
-                powershell_cmd = f'Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak("{text_escaped}")'
-                self.current_process = subprocess.Popen(["powershell", "-Command", powershell_cmd],
-                                                      stdout=subprocess.DEVNULL, 
-                                                      stderr=subprocess.DEVNULL)
+                powershell_cmd = (
+                    f'Add-Type -AssemblyName System.Speech; '
+                    f'$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer; '
+                    f'$synth.Rate = {rate_value}; '
+                    f'$synth.Speak("{text_escaped}")'
+                )
+                self.current_process = subprocess.Popen(
+                    ["powershell", "-Command", powershell_cmd],
+                    stdout=subprocess.DEVNULL, 
+                    stderr=subprocess.DEVNULL
+                )
             
             elif platform == "Linux":
-                # Try espeak on Linux if available
+                # Try espeak on Linux if available, with speed control
+                # espeak normal speed is ~175 wpm
+                speed = int(175 * self.speed)
                 try:
-                    self.current_process = subprocess.Popen(["espeak", text],
-                                                          stdout=subprocess.DEVNULL, 
-                                                          stderr=subprocess.DEVNULL)
+                    self.current_process = subprocess.Popen(
+                        ["espeak", "-s", str(speed), text],
+                        stdout=subprocess.DEVNULL, 
+                        stderr=subprocess.DEVNULL
+                    )
                 except FileNotFoundError:
                     logging.warning("espeak not found on Linux, TTS will not work")
                     self.current_process = None
@@ -151,7 +178,7 @@ class ImprovedTTSManager:
                 logging.warning(f"TTS not supported on platform: {platform}")
                 self.current_process = None
             
-            logging.debug(f"TTS process started for text: {text[:50]}...")
+            logging.debug(f"TTS process started for text: {text[:50]}... (speed: {self.speed})")
         
         except Exception as e:
             logging.error(f"Error executing TTS command: {str(e)}")
@@ -177,6 +204,36 @@ class ImprovedTTSManager:
         elif enabled and not was_enabled and self.message_queue:
             # If we're enabling and have messages in the queue, start processing
             self._process_next_in_queue()
+    
+    def set_speed(self, speed_multiplier):
+        """Set the TTS speed multiplier (1.0 is normal speed)"""
+        try:
+            # Ensure speed is within a reasonable range (0.5 to 2.0)
+            speed_multiplier = float(speed_multiplier)
+            speed_multiplier = max(0.5, min(2.0, speed_multiplier))
+            
+            self.speed = speed_multiplier
+            logging.debug(f"TTS speed set to {self.speed}")
+            return True
+        except Exception as e:
+            logging.error(f"Error setting TTS speed: {str(e)}")
+            return False
+    
+    def skip_current(self):
+        """Skip the current item in the TTS queue"""
+        try:
+            if self.current_process is not None and self.current_process.poll() is None:
+                # Terminate the current speech process
+                self.current_process.terminate()
+                self.current_process = None
+                logging.debug("Skipped current TTS item")
+            
+            # Force processing of next item
+            QTimer.singleShot(50, self._process_next_in_queue)
+            return True
+        except Exception as e:
+            logging.error(f"Error skipping current TTS item: {str(e)}")
+            return False
     
     def stop(self):
         """Clean up resources"""
@@ -343,15 +400,41 @@ class RecordingTranscriberWidget(QWidget):
         # Initialize TTS manager
         self.tts_manager = ImprovedTTSManager()
         
-        # Add TTS toggle checkbox
+        # Add TTS controls in a group
+        self.tts_group_box = QGroupBox(_("Text-to-Speech Controls"))
+        tts_layout = QVBoxLayout()
+        
+        # TTS Enable checkbox
         self.tts_checkbox = QCheckBox(_("Enable Text-to-Speech"))
         self.tts_checkbox.setChecked(False)
         self.tts_checkbox.stateChanged.connect(self.on_tts_toggle)
-        
-        # Add checkbox to layout (after record_button_layout)
-        tts_layout = QHBoxLayout()
         tts_layout.addWidget(self.tts_checkbox)
-        layout.addLayout(tts_layout)
+        
+        # TTS Speed control
+        speed_layout = QHBoxLayout()
+        speed_layout.addWidget(QLabel(_("Speed:")))
+        
+        self.tts_speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.tts_speed_slider.setMinimum(50)  # 0.5x speed
+        self.tts_speed_slider.setMaximum(200)  # 2.0x speed
+        self.tts_speed_slider.setValue(100)  # 1.0x speed (normal)
+        self.tts_speed_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.tts_speed_slider.setTickInterval(25)
+        self.tts_speed_slider.valueChanged.connect(self.on_tts_speed_changed)
+        speed_layout.addWidget(self.tts_speed_slider)
+        
+        self.tts_speed_label = QLabel("1.0x")
+        speed_layout.addWidget(self.tts_speed_label)
+        tts_layout.addLayout(speed_layout)
+        
+        # Skip button
+        self.tts_skip_button = QPushButton(_("Skip Current"))
+        self.tts_skip_button.clicked.connect(self.on_tts_skip_clicked)
+        self.tts_skip_button.setEnabled(False)  # Initially disabled
+        tts_layout.addWidget(self.tts_skip_button)
+        
+        self.tts_group_box.setLayout(tts_layout)
+        layout.addWidget(self.tts_group_box)
 
 
     def on_tts_toggle(self, state):
@@ -359,6 +442,9 @@ class RecordingTranscriberWidget(QWidget):
             enabled = state == Qt.CheckState.Checked.value
             logging.debug(f"TTS toggle requested: {enabled}")
             self.tts_manager.set_enabled(enabled)
+            
+            # Enable or disable the skip button based on TTS state
+            self.tts_skip_button.setEnabled(enabled)
             
             if not enabled:
                 self.tts_checkbox.setChecked(False)
@@ -371,6 +457,26 @@ class RecordingTranscriberWidget(QWidget):
                 "TTS Error",
                 "Failed to initialize text-to-speech. Please check your audio settings."
             )
+    
+    def on_tts_speed_changed(self, value):
+        try:
+            # Convert slider value (50-200) to speed multiplier (0.5-2.0)
+            speed = value / 100.0
+            self.tts_speed_label.setText(f"{speed:.1f}x")
+            
+            if self.tts_manager:
+                success = self.tts_manager.set_speed(speed)
+                if not success:
+                    logging.warning("Failed to set TTS speed")
+        except Exception as e:
+            logging.error(f"Error setting TTS speed: {str(e)}")
+    
+    def on_tts_skip_clicked(self):
+        try:
+            if self.tts_manager:
+                self.tts_manager.skip_current()
+        except Exception as e:
+            logging.error(f"Error skipping TTS item: {str(e)}")
 
 
     def setup_for_export(self):
