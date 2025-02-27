@@ -1,9 +1,11 @@
 import os
 import re
 import enum
+import json
 import logging
 import datetime
 import sounddevice
+import requests
 from enum import auto
 from typing import Optional, Tuple, Any
 from queue import Queue, Empty
@@ -312,6 +314,7 @@ class ImprovedTTSManager:
     def __del__(self):
         self.stop()
 
+
 class RecordingTranscriberWidget(QWidget):
     current_status: "RecordingStatus"
     transcription_options: TranscriptionOptions
@@ -468,6 +471,12 @@ class RecordingTranscriberWidget(QWidget):
         self.tts_checkbox.stateChanged.connect(self.on_tts_toggle)
         tts_layout.addWidget(self.tts_checkbox)
         
+        # Add webhook checkbox
+        self.webhook_checkbox = QCheckBox(_("Enable Webhook (POST to API)"))
+        self.webhook_checkbox.setChecked(False)
+        self.webhook_checkbox.setToolTip(_("Send translations to http://localhost:3632/api/translation"))
+        tts_layout.addWidget(self.webhook_checkbox)
+        
         # TTS Speed control
         speed_layout = QHBoxLayout()
         speed_layout.addWidget(QLabel(_("Speed:")))
@@ -565,6 +574,43 @@ class RecordingTranscriberWidget(QWidget):
                 self.tts_manager.check_health()
         except Exception as e:
             logging.error(f"Error in TTS health check: {str(e)}")
+            
+    def send_to_webhook(self, text):
+        """Send translation to the webhook endpoint"""
+        if not self.webhook_checkbox.isChecked():
+            return
+            
+        try:
+            # Create payload with timestamp and translation
+            payload = {
+                "timestamp": datetime.datetime.now().isoformat(),
+                "translation": text
+            }
+            
+            # Send POST request asynchronously to avoid blocking
+            def send_request():
+                try:
+                    response = requests.post(
+                        "http://localhost:3632/api/translation",
+                        json=payload,
+                        timeout=5  # Set a reasonable timeout
+                    )
+                    if response.status_code >= 200 and response.status_code < 300:
+                        logging.debug(f"Webhook sent successfully: {response.status_code}")
+                    else:
+                        logging.warning(f"Webhook returned non-success status: {response.status_code}")
+                except Exception as e:
+                    # Log error but don't interfere with application flow
+                    logging.error(f"Error sending webhook: {str(e)}")
+                    
+            # Start a thread for the request to not block the UI
+            webhook_thread = Thread(target=send_request)
+            webhook_thread.daemon = True
+            webhook_thread.start()
+            
+        except Exception as e:
+            # Log error but continue
+            logging.error(f"Error preparing webhook: {str(e)}")
 
     def on_transcription_options_changed(
         self, transcription_options: TranscriptionOptions
@@ -886,6 +932,9 @@ class RecordingTranscriberWidget(QWidget):
                 self.tts_clear_button.setEnabled(True)
         except Exception as e:
             logging.error(f"TTS error in translation: {str(e)}")
+            
+        # Send to webhook if enabled
+        self.send_to_webhook(text)
 
         # Rest of the existing translation display code...
         if self.transcriber_mode == RecordingTranscriberMode.APPEND_BELOW:
