@@ -575,18 +575,23 @@ class RecordingTranscriberWidget(QWidget):
         except Exception as e:
             logging.error(f"Error in TTS health check: {str(e)}")
             
-    def send_to_webhook(self, text):
-        """Send translation to the webhook endpoint"""
+    def send_to_webhook(self, text, text_type="translation"):
+        """Send text to the webhook endpoint
+        
+        Args:
+            text (str): The text to send
+            text_type (str): Either "translation" or "transcription"
+        """
         if not self.webhook_checkbox.isChecked():
             return
-            
+                
         try:
-            # Create payload with timestamp and translation
+            # Create payload with timestamp and text
             payload = {
                 "timestamp": datetime.datetime.now().isoformat(),
-                "translation": text
+                "translation": text  # Keep field name as "translation" for backwards compatibility
             }
-            
+                
             # Send POST request asynchronously to avoid blocking
             def send_request():
                 try:
@@ -602,12 +607,12 @@ class RecordingTranscriberWidget(QWidget):
                 except Exception as e:
                     # Log error but don't interfere with application flow
                     logging.error(f"Error sending webhook: {str(e)}")
-                    
+                        
             # Start a thread for the request to not block the UI
             webhook_thread = Thread(target=send_request)
             webhook_thread.daemon = True
             webhook_thread.start()
-            
+                
         except Exception as e:
             # Log error but continue
             logging.error(f"Error preparing webhook: {str(e)}")
@@ -865,6 +870,9 @@ class RecordingTranscriberWidget(QWidget):
 
         if len(text) == 0:
             return
+
+        # Send to webhook if enabled (add this line)
+        self.send_to_webhook(text, text_type="transcription")
 
         if self.translator is not None:
             self.translator.enqueue(text)
